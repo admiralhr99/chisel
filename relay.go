@@ -42,19 +42,29 @@ var relayHelp = `
     --tls-skip-verify  Skip TLS certificate verification
     -v                 Verbose logging
 
+  FORWARD MODE (client listens, server connects to target):
+    chisel relay-client server:8443 30949:localhost:30949
+
+  REVERSE MODE (server listens, client connects to target):
+    chisel relay-client server:8443 R:30949:localhost:30949
+
   Examples:
-    # Server (Germany)
-    chisel relay-server -p 8443 --tls-cert cert.pem --tls-key key.pem \
-      --reality-privkey "..." --reality-shortid "abc123"
+    # === FORWARD MODE ===
+    # Server (Germany) - runs relay-server
+    chisel relay-server -p 8443 --reality-privkey "..." --reality-shortid "..."
 
-    # Client (Iran) - forward local:30949 to server's localhost:30949
-    chisel relay-client --reality-pubkey "..." --reality-shortid "abc123" \
-      server.com:8443 0.0.0.0:30949:localhost:30949
+    # Client (Iran) - listens on 30949, forwards to Germany's localhost:30949
+    chisel relay-client --reality-pubkey "..." --reality-shortid "..." \
+      germany:8443 30949:localhost:30949
 
-    # Test speed with iperf3
-    # Server: iperf3 -s -p 5201
-    # Client tunnel: chisel relay-client ... server:8443 5201:localhost:5201
-    # Test: iperf3 -c localhost -p 5201
+    # === REVERSE MODE (Germany behind NAT) ===
+    # Server (Iran) - runs relay-server with open port
+    chisel relay-server -p 9443 --reality-privkey "..." --reality-shortid "..."
+
+    # Client (Germany) - connects to Iran, tells it to listen on 30949
+    #                    traffic from Iran:30949 -> tunnel -> Germany localhost:30949
+    chisel relay-client --reality-pubkey "..." --reality-shortid "..." \
+      iran:9443 R:30949:localhost:30949
 
 `
 
@@ -63,7 +73,30 @@ const (
 	authTimeout   = 10 * time.Second
 	dialTimeout   = 10 * time.Second
 	maxTargetLen  = 256
+
+	// Protocol commands
+	cmdForward = "F" // Forward mode: F<target>
+	cmdReverse = "R" // Reverse mode: R<listen-port>:<forward-target>
+	cmdConnect = "C" // Data connection for reverse: C<conn-id>
 )
+
+// reverseListener manages reverse tunnel listeners
+type reverseListener struct {
+	sync.RWMutex
+	listeners map[string]*reverseSession
+}
+
+type reverseSession struct {
+	listener    net.Listener
+	controlConn net.Conn
+	forwardAddr string
+	connQueue   chan net.Conn
+	verbose     bool
+}
+
+var globalReverse = &reverseListener{
+	listeners: make(map[string]*reverseSession),
+}
 
 // relayServer runs the fast relay server
 func relayServer(args []string) {
@@ -150,12 +183,10 @@ func relayServer(args []string) {
 }
 
 func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []byte, realityEnabled, verbose bool) {
-	defer conn.Close()
-
 	conn.SetDeadline(time.Now().Add(authTimeout))
 
 	// Read auth header (if Reality enabled)
-	// Protocol: [1 byte: auth len][auth data][1 byte: target len][target string]
+	// Protocol: [2 bytes: auth len][auth data][1 byte: cmd len][cmd string]
 	if realityEnabled {
 		// Read auth length
 		authLenBuf := make([]byte, 2)
@@ -163,6 +194,7 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 			if verbose {
 				log.Printf("[%d] Failed to read auth length: %v", id, err)
 			}
+			conn.Close()
 			return
 		}
 		authLen := binary.BigEndian.Uint16(authLenBuf)
@@ -170,6 +202,7 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 			if verbose {
 				log.Printf("[%d] Invalid auth length: %d", id, authLen)
 			}
+			conn.Close()
 			return
 		}
 
@@ -179,6 +212,7 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 			if verbose {
 				log.Printf("[%d] Failed to read auth: %v", id, err)
 			}
+			conn.Close()
 			return
 		}
 
@@ -187,6 +221,7 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 			if verbose {
 				log.Printf("[%d] Auth data too short", id)
 			}
+			conn.Close()
 			return
 		}
 
@@ -200,6 +235,7 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 			if verbose {
 				log.Printf("[%d] Reality auth failed: %v", id, err)
 			}
+			conn.Close()
 			return
 		}
 
@@ -208,34 +244,54 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 		}
 	}
 
-	// Read target length
-	targetLenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, targetLenBuf); err != nil {
+	// Read command length
+	cmdLenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, cmdLenBuf); err != nil {
 		if verbose {
-			log.Printf("[%d] Failed to read target length: %v", id, err)
+			log.Printf("[%d] Failed to read cmd length: %v", id, err)
 		}
+		conn.Close()
 		return
 	}
-	targetLen := int(targetLenBuf[0])
-	if targetLen == 0 || targetLen > maxTargetLen {
+	cmdLen := int(cmdLenBuf[0])
+	if cmdLen == 0 || cmdLen > maxTargetLen {
 		if verbose {
-			log.Printf("[%d] Invalid target length: %d", id, targetLen)
+			log.Printf("[%d] Invalid cmd length: %d", id, cmdLen)
 		}
+		conn.Close()
 		return
 	}
 
-	// Read target address
-	targetBuf := make([]byte, targetLen)
-	if _, err := io.ReadFull(conn, targetBuf); err != nil {
+	// Read command
+	cmdBuf := make([]byte, cmdLen)
+	if _, err := io.ReadFull(conn, cmdBuf); err != nil {
 		if verbose {
-			log.Printf("[%d] Failed to read target: %v", id, err)
+			log.Printf("[%d] Failed to read cmd: %v", id, err)
 		}
+		conn.Close()
 		return
 	}
-	target := string(targetBuf)
+	cmd := string(cmdBuf)
 
 	// Clear deadline
 	conn.SetDeadline(time.Time{})
+
+	// Handle different commands
+	if strings.HasPrefix(cmd, "R:") {
+		// Reverse mode: R:<listen-port>:<forward-target>
+		handleReverseRegister(conn, id, cmd[2:], verbose)
+	} else if strings.HasPrefix(cmd, "C:") {
+		// Data connection for reverse: C:<listen-port>
+		handleReverseData(conn, id, cmd[2:], verbose)
+	} else {
+		// Forward mode: direct target address
+		handleForwardConnection(conn, id, cmd, verbose)
+	}
+}
+
+// handleForwardConnection handles forward mode - connect to target and relay
+func handleForwardConnection(conn net.Conn, id int64, target string, verbose bool) {
+	defer conn.Close()
 
 	// Connect to target
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
@@ -248,7 +304,7 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 	defer targetConn.Close()
 
 	if verbose {
-		log.Printf("[%d] Connected: client -> %s", id, target)
+		log.Printf("[%d] Forward: client -> %s", id, target)
 	}
 
 	// Relay data
@@ -256,6 +312,149 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 
 	if verbose {
 		log.Printf("[%d] Closed: sent=%d recv=%d", id, sent, recv)
+	}
+}
+
+// handleReverseRegister handles reverse mode registration
+// cmd format: <listen-port>:<forward-target>
+func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
+	parts := strings.SplitN(cmd, ":", 2)
+	if len(parts) != 2 {
+		if verbose {
+			log.Printf("[%d] Invalid reverse cmd: %s", id, cmd)
+		}
+		conn.Close()
+		return
+	}
+
+	listenPort := parts[0]
+	forwardAddr := parts[1]
+	listenAddr := "0.0.0.0:" + listenPort
+
+	// Check if already listening
+	globalReverse.Lock()
+	if _, exists := globalReverse.listeners[listenPort]; exists {
+		globalReverse.Unlock()
+		log.Printf("[%d] Reverse port %s already in use", id, listenPort)
+		conn.Close()
+		return
+	}
+
+	// Start listener
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		globalReverse.Unlock()
+		log.Printf("[%d] Failed to listen on %s: %v", id, listenAddr, err)
+		conn.Close()
+		return
+	}
+
+	session := &reverseSession{
+		listener:    listener,
+		controlConn: conn,
+		forwardAddr: forwardAddr,
+		connQueue:   make(chan net.Conn, 100),
+		verbose:     verbose,
+	}
+
+	globalReverse.listeners[listenPort] = session
+	globalReverse.Unlock()
+
+	log.Printf("[%d] Reverse tunnel: listening on %s -> client -> %s", id, listenAddr, forwardAddr)
+
+	// Send OK to client
+	conn.Write([]byte("OK\n"))
+
+	// Accept incoming connections
+	go func() {
+		for {
+			incomingConn, err := listener.Accept()
+			if err != nil {
+				if verbose {
+					log.Printf("[%d] Reverse accept error: %v", id, err)
+				}
+				break
+			}
+
+			// Signal client to create data connection
+			_, err = conn.Write([]byte("NEW\n"))
+			if err != nil {
+				if verbose {
+					log.Printf("[%d] Failed to signal client: %v", id, err)
+				}
+				incomingConn.Close()
+				break
+			}
+
+			// Queue the connection
+			select {
+			case session.connQueue <- incomingConn:
+			default:
+				// Queue full, drop connection
+				incomingConn.Close()
+			}
+		}
+	}()
+
+	// Wait for control connection to close
+	buf := make([]byte, 1)
+	for {
+		_, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	// Cleanup
+	globalReverse.Lock()
+	delete(globalReverse.listeners, listenPort)
+	globalReverse.Unlock()
+
+	listener.Close()
+	close(session.connQueue)
+
+	// Drain and close any remaining connections
+	for c := range session.connQueue {
+		c.Close()
+	}
+
+	log.Printf("[%d] Reverse tunnel closed for port %s", id, listenPort)
+}
+
+// handleReverseData handles a data connection for reverse mode
+func handleReverseData(conn net.Conn, id int64, listenPort string, verbose bool) {
+	globalReverse.RLock()
+	session, exists := globalReverse.listeners[listenPort]
+	globalReverse.RUnlock()
+
+	if !exists {
+		if verbose {
+			log.Printf("[%d] No reverse session for port %s", id, listenPort)
+		}
+		conn.Close()
+		return
+	}
+
+	// Get incoming connection from queue
+	select {
+	case incomingConn := <-session.connQueue:
+		if verbose {
+			log.Printf("[%d] Reverse relay: %s -> client -> %s", id, incomingConn.RemoteAddr(), session.forwardAddr)
+		}
+		// Relay between incoming and client's data connection
+		go func() {
+			defer conn.Close()
+			defer incomingConn.Close()
+			sent, recv := relay(incomingConn, conn)
+			if verbose {
+				log.Printf("[%d] Reverse relay closed: sent=%d recv=%d", id, sent, recv)
+			}
+		}()
+	case <-time.After(10 * time.Second):
+		if verbose {
+			log.Printf("[%d] Reverse data timeout for port %s", id, listenPort)
+		}
+		conn.Close()
 	}
 }
 
@@ -276,41 +475,11 @@ func relayClient(args []string) {
 
 	args = flags.Args()
 	if len(args) < 2 {
-		log.Fatal("Usage: chisel relay-client [options] <server> <local>:<remote>")
+		log.Fatal("Usage: chisel relay-client [options] <server> <local>:<remote> or R:<remote-port>:<local>")
 	}
 
 	server := args[0]
 	mapping := args[1]
-
-	// Parse mapping: local:remote or local:remotehost:remoteport
-	parts := strings.SplitN(mapping, ":", 3)
-	var localAddr, remoteAddr string
-
-	if len(parts) == 2 {
-		// local:remote (same port)
-		localAddr = "0.0.0.0:" + parts[0]
-		remoteAddr = "localhost:" + parts[1]
-	} else if len(parts) == 3 {
-		// localport:remotehost:remoteport or localip:localport:...
-		if strings.Contains(parts[0], ".") {
-			// localip:localport:remoteport - assume remote is localhost
-			localAddr = parts[0] + ":" + parts[1]
-			remoteAddr = "localhost:" + parts[2]
-		} else {
-			// localport:remotehost:remoteport
-			localAddr = "0.0.0.0:" + parts[0]
-			remoteAddr = parts[1] + ":" + parts[2]
-		}
-	} else {
-		// Try parsing as full format: localip:localport:remotehost:remoteport
-		fullParts := strings.Split(mapping, ":")
-		if len(fullParts) == 4 {
-			localAddr = fullParts[0] + ":" + fullParts[1]
-			remoteAddr = fullParts[2] + ":" + fullParts[3]
-		} else {
-			log.Fatalf("Invalid mapping format: %s", mapping)
-		}
-	}
 
 	// Parse Reality key
 	var pubKey [32]byte
@@ -344,6 +513,43 @@ func relayClient(args []string) {
 		}
 	}
 
+	// Check if reverse mode
+	if strings.HasPrefix(mapping, "R:") {
+		runReverseClient(server, mapping[2:], pubKey, shortID, realityEnabled, useTLS, *tlsSkipVerify, *verbose)
+		return
+	}
+
+	// Forward mode - parse mapping
+	parts := strings.SplitN(mapping, ":", 3)
+	var localAddr, remoteAddr string
+
+	if len(parts) == 2 {
+		// local:remote (same port)
+		localAddr = "0.0.0.0:" + parts[0]
+		remoteAddr = "localhost:" + parts[1]
+	} else if len(parts) == 3 {
+		// localport:remotehost:remoteport or localip:localport:...
+		if strings.Contains(parts[0], ".") {
+			// localip:localport:remoteport - assume remote is localhost
+			localAddr = parts[0] + ":" + parts[1]
+			remoteAddr = "localhost:" + parts[2]
+		} else {
+			// localport:remotehost:remoteport
+			localAddr = "0.0.0.0:" + parts[0]
+			remoteAddr = parts[1] + ":" + parts[2]
+		}
+	} else {
+		// Try parsing as full format: localip:localport:remotehost:remoteport
+		fullParts := strings.Split(mapping, ":")
+		if len(fullParts) == 4 {
+			localAddr = fullParts[0] + ":" + fullParts[1]
+			remoteAddr = fullParts[2] + ":" + fullParts[3]
+		} else {
+			log.Fatalf("Invalid mapping format: %s", mapping)
+		}
+	}
+
+	log.Printf("relay-client: Forward mode")
 	log.Printf("relay-client: Forwarding %s -> %s -> %s", localAddr, server, remoteAddr)
 	if realityEnabled {
 		log.Printf("relay-client: Reality authentication enabled")
@@ -371,11 +577,143 @@ func relayClient(args []string) {
 	}
 }
 
-func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
-	defer localConn.Close()
+// runReverseClient runs the reverse mode client
+// mapping format: <server-listen-port>:<local-host>:<local-port>
+func runReverseClient(server, mapping string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+	parts := strings.SplitN(mapping, ":", 3)
+	if len(parts) < 2 {
+		log.Fatalf("Invalid reverse mapping: %s (expected port:host:port or port:port)", mapping)
+	}
 
+	var listenPort, localAddr string
+	if len(parts) == 2 {
+		listenPort = parts[0]
+		localAddr = "localhost:" + parts[1]
+	} else {
+		listenPort = parts[0]
+		localAddr = parts[1] + ":" + parts[2]
+	}
+
+	log.Printf("relay-client: Reverse mode")
+	log.Printf("relay-client: Server %s listens on :%s -> tunnel -> local %s", server, listenPort, localAddr)
+	if realityEnabled {
+		log.Printf("relay-client: Reality authentication enabled")
+	}
+
+	for {
+		// Connect control connection
+		controlConn, err := dialServer(server, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+		if err != nil {
+			log.Printf("Failed to connect: %v, retrying in 5s...", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Send reverse registration: R:<listen-port>:<forward-target>
+		cmd := fmt.Sprintf("R:%s:%s", listenPort, localAddr)
+		if err := sendCommand(controlConn, cmd, realityEnabled, pubKey, shortID); err != nil {
+			log.Printf("Failed to send command: %v", err)
+			controlConn.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Wait for OK
+		buf := make([]byte, 3)
+		controlConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		n, err := controlConn.Read(buf)
+		if err != nil || !strings.HasPrefix(string(buf[:n]), "OK") {
+			log.Printf("Failed to register reverse tunnel: %v", err)
+			controlConn.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		controlConn.SetReadDeadline(time.Time{})
+
+		log.Printf("relay-client: Reverse tunnel established, server listening on :%s", listenPort)
+
+		// Handle signals
+		handleReverseClientSignals(controlConn, server, listenPort, localAddr, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+
+		log.Printf("relay-client: Control connection lost, reconnecting...")
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func handleReverseClientSignals(controlConn net.Conn, server, listenPort, localAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+	defer controlConn.Close()
+
+	reader := make([]byte, 64)
+	for {
+		n, err := controlConn.Read(reader)
+		if err != nil {
+			if verbose {
+				log.Printf("Control connection error: %v", err)
+			}
+			return
+		}
+
+		msg := strings.TrimSpace(string(reader[:n]))
+		if verbose {
+			log.Printf("Control signal: %s", msg)
+		}
+
+		// Handle NEW signal - create data connection
+		if strings.Contains(msg, "NEW") {
+			// Count how many NEW signals (could be multiple)
+			count := strings.Count(msg, "NEW")
+			for i := 0; i < count; i++ {
+				go createReverseDataConnection(server, listenPort, localAddr, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+			}
+		}
+	}
+}
+
+func createReverseDataConnection(server, listenPort, localAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
 	// Connect to server
-	var serverConn net.Conn
+	serverConn, err := dialServer(server, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+	if err != nil {
+		if verbose {
+			log.Printf("Failed to create data connection: %v", err)
+		}
+		return
+	}
+
+	// Send data connection command: C:<listen-port>
+	cmd := fmt.Sprintf("C:%s", listenPort)
+	if err := sendCommand(serverConn, cmd, realityEnabled, pubKey, shortID); err != nil {
+		if verbose {
+			log.Printf("Failed to send data command: %v", err)
+		}
+		serverConn.Close()
+		return
+	}
+
+	// Connect to local service
+	localConn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
+	if err != nil {
+		if verbose {
+			log.Printf("Failed to connect to local %s: %v", localAddr, err)
+		}
+		serverConn.Close()
+		return
+	}
+
+	if verbose {
+		log.Printf("Reverse data: server:%s -> %s", listenPort, localAddr)
+	}
+
+	// Relay
+	go func() {
+		defer serverConn.Close()
+		defer localConn.Close()
+		relay(serverConn, localConn)
+	}()
+}
+
+// dialServer creates a connection to the relay server
+func dialServer(server string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) (net.Conn, error) {
+	var conn net.Conn
 	var err error
 
 	if useTLS {
@@ -383,10 +721,7 @@ func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr stri
 			// Use uTLS for Chrome fingerprint
 			tcpConn, err := net.DialTimeout("tcp", server, dialTimeout)
 			if err != nil {
-				if verbose {
-					log.Printf("[%d] Failed to connect to server: %v", id, err)
-				}
-				return
+				return nil, err
 			}
 
 			host, _, _ := net.SplitHostPort(server)
@@ -398,49 +733,41 @@ func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr stri
 			tlsConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
 			if err := tlsConn.Handshake(); err != nil {
 				tcpConn.Close()
-				if verbose {
-					log.Printf("[%d] TLS handshake failed: %v", id, err)
-				}
-				return
+				return nil, err
 			}
-			serverConn = tlsConn
+			conn = tlsConn
 		} else {
 			// Standard TLS
-			serverConn, err = tls.DialWithDialer(
+			conn, err = tls.DialWithDialer(
 				&net.Dialer{Timeout: dialTimeout},
 				"tcp",
 				server,
 				&tls.Config{InsecureSkipVerify: tlsSkipVerify},
 			)
 			if err != nil {
-				if verbose {
-					log.Printf("[%d] Failed to connect to server: %v", id, err)
-				}
-				return
+				return nil, err
 			}
 		}
 	} else {
-		serverConn, err = net.DialTimeout("tcp", server, dialTimeout)
+		conn, err = net.DialTimeout("tcp", server, dialTimeout)
 		if err != nil {
-			if verbose {
-				log.Printf("[%d] Failed to connect to server: %v", id, err)
-			}
-			return
+			return nil, err
 		}
 	}
-	defer serverConn.Close()
 
-	// Send auth and target
-	serverConn.SetDeadline(time.Now().Add(authTimeout))
+	return conn, nil
+}
+
+// sendCommand sends authenticated command to server
+func sendCommand(conn net.Conn, cmd string, realityEnabled bool, pubKey [32]byte, shortID []byte) error {
+	conn.SetDeadline(time.Now().Add(authTimeout))
+	defer conn.SetDeadline(time.Time{})
 
 	if realityEnabled {
 		// Create Reality session
 		sessionID, clientPubKey, err := reality.CreateSessionID(pubKey, shortID)
 		if err != nil {
-			if verbose {
-				log.Printf("[%d] Failed to create session: %v", id, err)
-			}
-			return
+			return err
 		}
 
 		// Send auth: [2 bytes: len][32 bytes sessionID][32 bytes pubkey]
@@ -451,47 +778,53 @@ func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr stri
 		authLen := make([]byte, 2)
 		binary.BigEndian.PutUint16(authLen, uint16(len(authData)))
 
-		if _, err := serverConn.Write(authLen); err != nil {
-			if verbose {
-				log.Printf("[%d] Failed to send auth length: %v", id, err)
-			}
-			return
+		if _, err := conn.Write(authLen); err != nil {
+			return err
 		}
-		if _, err := serverConn.Write(authData); err != nil {
-			if verbose {
-				log.Printf("[%d] Failed to send auth: %v", id, err)
-			}
-			return
+		if _, err := conn.Write(authData); err != nil {
+			return err
 		}
 	}
 
-	// Send target: [1 byte: len][target string]
-	targetBytes := []byte(remoteAddr)
-	if len(targetBytes) > maxTargetLen {
-		if verbose {
-			log.Printf("[%d] Target too long", id)
-		}
-		return
+	// Send command: [1 byte: len][command string]
+	cmdBytes := []byte(cmd)
+	if len(cmdBytes) > maxTargetLen {
+		return fmt.Errorf("command too long")
 	}
 
-	if _, err := serverConn.Write([]byte{byte(len(targetBytes))}); err != nil {
-		if verbose {
-			log.Printf("[%d] Failed to send target length: %v", id, err)
-		}
-		return
+	if _, err := conn.Write([]byte{byte(len(cmdBytes))}); err != nil {
+		return err
 	}
-	if _, err := serverConn.Write(targetBytes); err != nil {
-		if verbose {
-			log.Printf("[%d] Failed to send target: %v", id, err)
-		}
-		return
+	if _, err := conn.Write(cmdBytes); err != nil {
+		return err
 	}
 
-	// Clear deadline
-	serverConn.SetDeadline(time.Time{})
+	return nil
+}
+
+func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+	defer localConn.Close()
+
+	// Connect to server
+	serverConn, err := dialServer(server, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+	if err != nil {
+		if verbose {
+			log.Printf("[%d] Failed to connect to server: %v", id, err)
+		}
+		return
+	}
+	defer serverConn.Close()
+
+	// Send target (forward command)
+	if err := sendCommand(serverConn, remoteAddr, realityEnabled, pubKey, shortID); err != nil {
+		if verbose {
+			log.Printf("[%d] Failed to send command: %v", id, err)
+		}
+		return
+	}
 
 	if verbose {
-		log.Printf("[%d] Connected: local -> %s -> %s", id, server, remoteAddr)
+		log.Printf("[%d] Forward: local -> %s -> %s", id, server, remoteAddr)
 	}
 
 	// Relay
