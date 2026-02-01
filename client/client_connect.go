@@ -86,9 +86,13 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	}
 
 	// Use uTLS for Reality authentication (Chrome fingerprint)
+	// When using uTLS, we handle TLS ourselves, so tell websocket to use ws:// internally
+	wsURL := c.server
 	if c.realityEnabled && strings.HasPrefix(c.server, "wss://") {
 		d.NetDialContext = c.dialUTLS
 		d.TLSClientConfig = nil // uTLS handles TLS
+		// Change wss:// to ws:// since TLS is already handled by dialUTLS
+		wsURL = "ws://" + strings.TrimPrefix(c.server, "wss://")
 	}
 
 	//optional proxy
@@ -104,7 +108,7 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		return false, err
 	}
 
-	wsConn, _, err := d.DialContext(ctx, c.server, headers)
+	wsConn, _, err := d.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		return false, err
 	}
