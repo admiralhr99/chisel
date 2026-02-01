@@ -1,13 +1,20 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"strings"
@@ -26,12 +33,13 @@ var relayHelp = `
          chisel relay-client [options] <server> <local>:<remote>
 
   FAST TCP relay with Reality authentication (no SSH overhead).
-  Use this for maximum speed when tunneling TCP traffic.
+  Designed to evade DPI by looking like normal HTTPS traffic.
 
   relay-server options:
-    --port, -p         Port to listen on (default: 8443)
-    --tls-cert         TLS certificate file (required for TLS)
-    --tls-key          TLS key file (required for TLS)
+    --port, -p         Port to listen on (default: 443)
+    --tls-cert         TLS certificate file (auto-generated if not provided)
+    --tls-key          TLS key file (auto-generated if not provided)
+    --tls-domain       Domain for auto-generated cert (default: www.microsoft.com)
     --reality-privkey  Reality private key (from 'chisel genkey')
     --reality-shortid  Reality short ID
     -v                 Verbose logging
@@ -39,32 +47,36 @@ var relayHelp = `
   relay-client options:
     --reality-pubkey   Reality public key
     --reality-shortid  Reality short ID
-    --tls-skip-verify  Skip TLS certificate verification
+    --sni              SNI hostname to send (default: www.microsoft.com)
+                       Use popular sites: google.com, microsoft.com, apple.com
+    --tls-skip-verify  Skip TLS certificate verification (required for auto-cert)
     -v                 Verbose logging
 
+  DPI EVASION:
+    - Uses uTLS with Chrome browser fingerprint
+    - SNI spoofing to look like connecting to legitimate sites
+    - ALPN negotiation (h2, http/1.1) like real browsers
+    - Auto-generates TLS cert if none provided
+
   FORWARD MODE (client listens, server connects to target):
-    chisel relay-client server:8443 30949:localhost:30949
+    chisel relay-client --sni google.com server:443 30949:localhost:30949
 
   REVERSE MODE (server listens, client connects to target):
-    chisel relay-client server:8443 R:30949:localhost:30949
+    chisel relay-client --sni google.com server:443 R:30949:localhost:30949
 
   Examples:
-    # === FORWARD MODE ===
-    # Server (Germany) - runs relay-server
-    chisel relay-server -p 8443 --reality-privkey "..." --reality-shortid "..."
+    # === SERVER (Iran - has open IP) ===
+    chisel relay-server -p 443 \
+      --reality-privkey "..." --reality-shortid "..." -v
 
-    # Client (Iran) - listens on 30949, forwards to Germany's localhost:30949
-    chisel relay-client --reality-pubkey "..." --reality-shortid "..." \
-      germany:8443 30949:localhost:30949
+    # === CLIENT (Germany - behind NAT, has V2Ray on 30949) ===
+    # Reverse mode: Iran listens on 30949, forwards to Germany's V2Ray
+    chisel relay-client \
+      --reality-pubkey "..." --reality-shortid "..." \
+      --sni www.google.com --tls-skip-verify \
+      iran-ip:443 R:30949:localhost:30949 -v
 
-    # === REVERSE MODE (Germany behind NAT) ===
-    # Server (Iran) - runs relay-server with open port
-    chisel relay-server -p 9443 --reality-privkey "..." --reality-shortid "..."
-
-    # Client (Germany) - connects to Iran, tells it to listen on 30949
-    #                    traffic from Iran:30949 -> tunnel -> Germany localhost:30949
-    chisel relay-client --reality-pubkey "..." --reality-shortid "..." \
-      iran:9443 R:30949:localhost:30949
+    # Traffic flow: User -> Iran:30949 -> [TLS tunnel] -> Germany:30949 (V2Ray)
 
 `
 
@@ -98,14 +110,51 @@ var globalReverse = &reverseListener{
 	listeners: make(map[string]*reverseSession),
 }
 
+// generateSelfSignedCert creates a self-signed certificate for TLS
+func generateSelfSignedCert(domain string) (tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{domain},
+			CommonName:   domain,
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{domain, "*." + domain},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	privDER, _ := x509.MarshalECPrivateKey(priv)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privDER})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
 // relayServer runs the fast relay server
 func relayServer(args []string) {
 	flags := flag.NewFlagSet("relay-server", flag.ContinueOnError)
 
-	port := flags.String("port", "8443", "")
+	port := flags.String("port", "443", "")
 	p := flags.String("p", "", "")
 	tlsCert := flags.String("tls-cert", "", "")
 	tlsKey := flags.String("tls-key", "", "")
+	tlsDomain := flags.String("tls-domain", "www.microsoft.com", "")
+	noTLS := flags.Bool("no-tls", false, "")
 	realityPrivkey := flags.String("reality-privkey", "", "")
 	realityShortID := flags.String("reality-shortid", "", "")
 	verbose := flags.Bool("v", false, "")
@@ -143,25 +192,41 @@ func relayServer(args []string) {
 
 	addr := "0.0.0.0:" + *port
 
-	if *tlsCert != "" && *tlsKey != "" {
-		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+	if *noTLS {
+		// Raw TCP (not recommended - DPI can detect)
+		listener, err = net.Listen("tcp", addr)
 		if err != nil {
-			log.Fatalf("Failed to load TLS cert: %v", err)
+			log.Fatalf("Failed to listen: %v", err)
 		}
+		log.Printf("relay-server: Listening on %s (no TLS - NOT DPI resistant!)", addr)
+	} else {
+		// TLS mode (recommended for DPI evasion)
+		var cert tls.Certificate
+		if *tlsCert != "" && *tlsKey != "" {
+			cert, err = tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+			if err != nil {
+				log.Fatalf("Failed to load TLS cert: %v", err)
+			}
+			log.Printf("relay-server: Using provided TLS certificate")
+		} else {
+			// Auto-generate self-signed cert
+			cert, err = generateSelfSignedCert(*tlsDomain)
+			if err != nil {
+				log.Fatalf("Failed to generate TLS cert: %v", err)
+			}
+			log.Printf("relay-server: Auto-generated TLS cert for %s", *tlsDomain)
+		}
+
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2", "http/1.1"}, // ALPN - looks like HTTP/2
+			MinVersion:   tls.VersionTLS12,
 		}
 		listener, err = tls.Listen("tcp", addr, tlsConfig)
 		if err != nil {
 			log.Fatalf("Failed to listen: %v", err)
 		}
-		log.Printf("relay-server: Listening on %s (TLS)", addr)
-	} else {
-		listener, err = net.Listen("tcp", addr)
-		if err != nil {
-			log.Fatalf("Failed to listen: %v", err)
-		}
-		log.Printf("relay-server: Listening on %s (no TLS)", addr)
+		log.Printf("relay-server: Listening on %s (TLS with ALPN h2)", addr)
 	}
 
 	if realityEnabled {
@@ -464,7 +529,9 @@ func relayClient(args []string) {
 
 	realityPubkey := flags.String("reality-pubkey", "", "")
 	realityShortID := flags.String("reality-shortid", "", "")
+	sni := flags.String("sni", "www.microsoft.com", "")
 	tlsSkipVerify := flags.Bool("tls-skip-verify", false, "")
+	noTLS := flags.Bool("no-tls", false, "")
 	verbose := flags.Bool("v", false, "")
 
 	flags.Usage = func() {
@@ -499,9 +566,10 @@ func relayClient(args []string) {
 	}
 
 	// Determine if server uses TLS
-	useTLS := strings.HasSuffix(server, ":443") ||
-		strings.HasSuffix(server, ":8443") ||
-		strings.Contains(server, "https")
+	useTLS := !*noTLS
+	if !useTLS {
+		log.Printf("relay-client: WARNING - TLS disabled, traffic NOT DPI resistant!")
+	}
 
 	server = strings.TrimPrefix(server, "https://")
 	server = strings.TrimPrefix(server, "http://")
@@ -513,9 +581,21 @@ func relayClient(args []string) {
 		}
 	}
 
+	// Create client config
+	clientCfg := &relayClientConfig{
+		server:          server,
+		pubKey:          pubKey,
+		shortID:         shortID,
+		realityEnabled:  realityEnabled,
+		useTLS:          useTLS,
+		tlsSkipVerify:   *tlsSkipVerify,
+		sni:             *sni,
+		verbose:         *verbose,
+	}
+
 	// Check if reverse mode
 	if strings.HasPrefix(mapping, "R:") {
-		runReverseClient(server, mapping[2:], pubKey, shortID, realityEnabled, useTLS, *tlsSkipVerify, *verbose)
+		runReverseClient(mapping[2:], clientCfg)
 		return
 	}
 
@@ -552,7 +632,7 @@ func relayClient(args []string) {
 	log.Printf("relay-client: Forward mode")
 	log.Printf("relay-client: Forwarding %s -> %s -> %s", localAddr, server, remoteAddr)
 	if realityEnabled {
-		log.Printf("relay-client: Reality authentication enabled")
+		log.Printf("relay-client: Reality auth enabled, SNI: %s", *sni)
 	}
 
 	// Start local listener
@@ -573,13 +653,25 @@ func relayClient(args []string) {
 		}
 
 		id := atomic.AddInt64(&connID, 1)
-		go handleLocalConnection(localConn, id, server, remoteAddr, pubKey, shortID, realityEnabled, useTLS, *tlsSkipVerify, *verbose)
+		go handleLocalConnection(localConn, id, remoteAddr, clientCfg)
 	}
+}
+
+// relayClientConfig holds client configuration
+type relayClientConfig struct {
+	server          string
+	pubKey          [32]byte
+	shortID         []byte
+	realityEnabled  bool
+	useTLS          bool
+	tlsSkipVerify   bool
+	sni             string
+	verbose         bool
 }
 
 // runReverseClient runs the reverse mode client
 // mapping format: <server-listen-port>:<local-host>:<local-port>
-func runReverseClient(server, mapping string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+func runReverseClient(mapping string, cfg *relayClientConfig) {
 	parts := strings.SplitN(mapping, ":", 3)
 	if len(parts) < 2 {
 		log.Fatalf("Invalid reverse mapping: %s (expected port:host:port or port:port)", mapping)
@@ -595,14 +687,14 @@ func runReverseClient(server, mapping string, pubKey [32]byte, shortID []byte, r
 	}
 
 	log.Printf("relay-client: Reverse mode")
-	log.Printf("relay-client: Server %s listens on :%s -> tunnel -> local %s", server, listenPort, localAddr)
-	if realityEnabled {
-		log.Printf("relay-client: Reality authentication enabled")
+	log.Printf("relay-client: Server %s listens on :%s -> tunnel -> local %s", cfg.server, listenPort, localAddr)
+	if cfg.realityEnabled {
+		log.Printf("relay-client: Reality auth enabled, SNI: %s", cfg.sni)
 	}
 
 	for {
 		// Connect control connection
-		controlConn, err := dialServer(server, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+		controlConn, err := dialServer(cfg)
 		if err != nil {
 			log.Printf("Failed to connect: %v, retrying in 5s...", err)
 			time.Sleep(5 * time.Second)
@@ -611,7 +703,7 @@ func runReverseClient(server, mapping string, pubKey [32]byte, shortID []byte, r
 
 		// Send reverse registration: R:<listen-port>:<forward-target>
 		cmd := fmt.Sprintf("R:%s:%s", listenPort, localAddr)
-		if err := sendCommand(controlConn, cmd, realityEnabled, pubKey, shortID); err != nil {
+		if err := sendCommand(controlConn, cmd, cfg); err != nil {
 			log.Printf("Failed to send command: %v", err)
 			controlConn.Close()
 			time.Sleep(5 * time.Second)
@@ -633,28 +725,28 @@ func runReverseClient(server, mapping string, pubKey [32]byte, shortID []byte, r
 		log.Printf("relay-client: Reverse tunnel established, server listening on :%s", listenPort)
 
 		// Handle signals
-		handleReverseClientSignals(controlConn, server, listenPort, localAddr, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+		handleReverseClientSignals(controlConn, listenPort, localAddr, cfg)
 
 		log.Printf("relay-client: Control connection lost, reconnecting...")
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func handleReverseClientSignals(controlConn net.Conn, server, listenPort, localAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+func handleReverseClientSignals(controlConn net.Conn, listenPort, localAddr string, cfg *relayClientConfig) {
 	defer controlConn.Close()
 
 	reader := make([]byte, 64)
 	for {
 		n, err := controlConn.Read(reader)
 		if err != nil {
-			if verbose {
+			if cfg.verbose {
 				log.Printf("Control connection error: %v", err)
 			}
 			return
 		}
 
 		msg := strings.TrimSpace(string(reader[:n]))
-		if verbose {
+		if cfg.verbose {
 			log.Printf("Control signal: %s", msg)
 		}
 
@@ -663,17 +755,17 @@ func handleReverseClientSignals(controlConn net.Conn, server, listenPort, localA
 			// Count how many NEW signals (could be multiple)
 			count := strings.Count(msg, "NEW")
 			for i := 0; i < count; i++ {
-				go createReverseDataConnection(server, listenPort, localAddr, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+				go createReverseDataConnection(listenPort, localAddr, cfg)
 			}
 		}
 	}
 }
 
-func createReverseDataConnection(server, listenPort, localAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+func createReverseDataConnection(listenPort, localAddr string, cfg *relayClientConfig) {
 	// Connect to server
-	serverConn, err := dialServer(server, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+	serverConn, err := dialServer(cfg)
 	if err != nil {
-		if verbose {
+		if cfg.verbose {
 			log.Printf("Failed to create data connection: %v", err)
 		}
 		return
@@ -681,8 +773,8 @@ func createReverseDataConnection(server, listenPort, localAddr string, pubKey [3
 
 	// Send data connection command: C:<listen-port>
 	cmd := fmt.Sprintf("C:%s", listenPort)
-	if err := sendCommand(serverConn, cmd, realityEnabled, pubKey, shortID); err != nil {
-		if verbose {
+	if err := sendCommand(serverConn, cmd, cfg); err != nil {
+		if cfg.verbose {
 			log.Printf("Failed to send data command: %v", err)
 		}
 		serverConn.Close()
@@ -692,14 +784,14 @@ func createReverseDataConnection(server, listenPort, localAddr string, pubKey [3
 	// Connect to local service
 	localConn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
 	if err != nil {
-		if verbose {
+		if cfg.verbose {
 			log.Printf("Failed to connect to local %s: %v", localAddr, err)
 		}
 		serverConn.Close()
 		return
 	}
 
-	if verbose {
+	if cfg.verbose {
 		log.Printf("Reverse data: server:%s -> %s", listenPort, localAddr)
 	}
 
@@ -711,45 +803,44 @@ func createReverseDataConnection(server, listenPort, localAddr string, pubKey [3
 	}()
 }
 
-// dialServer creates a connection to the relay server
-func dialServer(server string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) (net.Conn, error) {
+// dialServer creates a connection to the relay server with DPI evasion
+func dialServer(cfg *relayClientConfig) (net.Conn, error) {
 	var conn net.Conn
 	var err error
 
-	if useTLS {
-		if realityEnabled {
-			// Use uTLS for Chrome fingerprint
-			tcpConn, err := net.DialTimeout("tcp", server, dialTimeout)
-			if err != nil {
-				return nil, err
-			}
+	if cfg.useTLS {
+		// Use uTLS for Chrome fingerprint (DPI evasion)
+		tcpConn, err := net.DialTimeout("tcp", cfg.server, dialTimeout)
+		if err != nil {
+			return nil, err
+		}
 
-			host, _, _ := net.SplitHostPort(server)
-			utlsConfig := &utls.Config{
-				ServerName:         host,
-				InsecureSkipVerify: tlsSkipVerify,
-			}
+		// Use SNI for DPI evasion - looks like connecting to legitimate site
+		sni := cfg.sni
+		if sni == "" {
+			sni, _, _ = net.SplitHostPort(cfg.server)
+		}
 
-			tlsConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
-			if err := tlsConn.Handshake(); err != nil {
-				tcpConn.Close()
-				return nil, err
-			}
-			conn = tlsConn
-		} else {
-			// Standard TLS
-			conn, err = tls.DialWithDialer(
-				&net.Dialer{Timeout: dialTimeout},
-				"tcp",
-				server,
-				&tls.Config{InsecureSkipVerify: tlsSkipVerify},
-			)
-			if err != nil {
-				return nil, err
-			}
+		utlsConfig := &utls.Config{
+			ServerName:         sni,                          // SNI spoofing
+			InsecureSkipVerify: cfg.tlsSkipVerify,
+			NextProtos:         []string{"h2", "http/1.1"},   // ALPN - looks like HTTP/2
+		}
+
+		// Use Chrome fingerprint for maximum compatibility
+		tlsConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
+		if err := tlsConn.Handshake(); err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("TLS handshake failed (SNI: %s): %v", sni, err)
+		}
+		conn = tlsConn
+
+		if cfg.verbose {
+			log.Printf("TLS connected with SNI: %s, ALPN: h2", sni)
 		}
 	} else {
-		conn, err = net.DialTimeout("tcp", server, dialTimeout)
+		// Raw TCP (not recommended - DPI can detect)
+		conn, err = net.DialTimeout("tcp", cfg.server, dialTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -759,13 +850,13 @@ func dialServer(server string, pubKey [32]byte, shortID []byte, realityEnabled, 
 }
 
 // sendCommand sends authenticated command to server
-func sendCommand(conn net.Conn, cmd string, realityEnabled bool, pubKey [32]byte, shortID []byte) error {
+func sendCommand(conn net.Conn, cmd string, cfg *relayClientConfig) error {
 	conn.SetDeadline(time.Now().Add(authTimeout))
 	defer conn.SetDeadline(time.Time{})
 
-	if realityEnabled {
+	if cfg.realityEnabled {
 		// Create Reality session
-		sessionID, clientPubKey, err := reality.CreateSessionID(pubKey, shortID)
+		sessionID, clientPubKey, err := reality.CreateSessionID(cfg.pubKey, cfg.shortID)
 		if err != nil {
 			return err
 		}
@@ -802,13 +893,13 @@ func sendCommand(conn net.Conn, cmd string, realityEnabled bool, pubKey [32]byte
 	return nil
 }
 
-func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr string, pubKey [32]byte, shortID []byte, realityEnabled, useTLS, tlsSkipVerify, verbose bool) {
+func handleLocalConnection(localConn net.Conn, id int64, remoteAddr string, cfg *relayClientConfig) {
 	defer localConn.Close()
 
 	// Connect to server
-	serverConn, err := dialServer(server, pubKey, shortID, realityEnabled, useTLS, tlsSkipVerify, verbose)
+	serverConn, err := dialServer(cfg)
 	if err != nil {
-		if verbose {
+		if cfg.verbose {
 			log.Printf("[%d] Failed to connect to server: %v", id, err)
 		}
 		return
@@ -816,21 +907,21 @@ func handleLocalConnection(localConn net.Conn, id int64, server, remoteAddr stri
 	defer serverConn.Close()
 
 	// Send target (forward command)
-	if err := sendCommand(serverConn, remoteAddr, realityEnabled, pubKey, shortID); err != nil {
-		if verbose {
+	if err := sendCommand(serverConn, remoteAddr, cfg); err != nil {
+		if cfg.verbose {
 			log.Printf("[%d] Failed to send command: %v", id, err)
 		}
 		return
 	}
 
-	if verbose {
-		log.Printf("[%d] Forward: local -> %s -> %s", id, server, remoteAddr)
+	if cfg.verbose {
+		log.Printf("[%d] Forward: local -> %s -> %s", id, cfg.server, remoteAddr)
 	}
 
 	// Relay
 	sent, recv := relay(localConn, serverConn)
 
-	if verbose {
+	if cfg.verbose {
 		log.Printf("[%d] Closed: sent=%d recv=%d", id, sent, recv)
 	}
 }
