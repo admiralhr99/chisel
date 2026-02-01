@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cos"
+	"github.com/jpillora/chisel/share/reality"
 	"github.com/jpillora/chisel/share/settings"
 )
 
@@ -27,6 +29,7 @@ var help = `
   Commands:
     server - runs chisel in server mode
     client - runs chisel in client mode
+    genkey - generates Reality keypair for authentication
 
   Read more:
     https://github.com/jpillora/chisel
@@ -60,10 +63,31 @@ func main() {
 		server(args)
 	case "client":
 		client(args)
+	case "genkey":
+		genkey()
 	default:
 		fmt.Print(help)
 		os.Exit(0)
 	}
+}
+
+// genkey generates a Reality keypair for authentication
+func genkey() {
+	priv, pub, err := reality.GenerateKeyPair()
+	if err != nil {
+		log.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	privB64 := base64.StdEncoding.EncodeToString(priv[:])
+	pubB64 := base64.StdEncoding.EncodeToString(pub[:])
+
+	fmt.Println("Reality X25519 Keypair Generated")
+	fmt.Println("================================")
+	fmt.Printf("Private Key: %s\n", privB64)
+	fmt.Printf("Public Key:  %s\n", pubB64)
+	fmt.Println()
+	fmt.Println("Server usage: chisel server --reality-privkey \"" + privB64 + "\"")
+	fmt.Println("Client usage: chisel client --reality-pubkey \"" + pubB64 + "\" ...")
 }
 
 var commonHelp = `
@@ -171,9 +195,21 @@ var serverHelp = `
     provide a certificate notification email by setting CHISEL_LE_EMAIL.
 
     --tls-ca, a path to a PEM encoded CA certificate bundle or a directory
-    holding multiple PEM encode CA certificate bundle files, which is used to 
-    validate client connections. The provided CA certificates will be used 
-    instead of the system roots. This is commonly used to implement mutual-TLS. 
+    holding multiple PEM encode CA certificate bundle files, which is used to
+    validate client connections. The provided CA certificates will be used
+    instead of the system roots. This is commonly used to implement mutual-TLS.
+
+    --reality-privkey, Enable Reality authentication with the provided
+    base64-encoded X25519 private key. Generate a keypair with 'chisel genkey'.
+    Reality provides DPI-resistant authentication by making traffic appear
+    as normal HTTPS to legitimate websites.
+
+    --reality-shortid, An optional short identifier for Reality authentication.
+    Must match the client's short ID.
+
+    --reality-fallback, URL to proxy unauthenticated requests to (anti-probing).
+    Defaults to https://www.microsoft.com. This makes probing attempts appear
+    as if they connected to a legitimate website.
 ` + commonHelp
 
 func server(args []string) {
@@ -194,6 +230,9 @@ func server(args []string) {
 	flags.StringVar(&config.TLS.Cert, "tls-cert", "", "")
 	flags.Var(multiFlag{&config.TLS.Domains}, "tls-domain", "")
 	flags.StringVar(&config.TLS.CA, "tls-ca", "", "")
+	flags.StringVar(&config.Reality.PrivateKey, "reality-privkey", "", "")
+	flags.StringVar(&config.Reality.ShortID, "reality-shortid", "", "")
+	flags.StringVar(&config.Reality.Fallback, "reality-fallback", "", "")
 
 	host := flags.String("host", "", "")
 	p := flags.String("p", "", "")
@@ -416,9 +455,17 @@ var clientHelp = `
     --tls-key, a path to a PEM encoded private key used for client 
     authentication (mutual-TLS).
 
-    --tls-cert, a path to a PEM encoded certificate matching the provided 
-    private key. The certificate must have client authentication 
+    --tls-cert, a path to a PEM encoded certificate matching the provided
+    private key. The certificate must have client authentication
     enabled (mutual-TLS).
+
+    --reality-pubkey, Enable Reality authentication with the provided
+    base64-encoded X25519 public key. Get the public key from the server
+    admin who generated it with 'chisel genkey'. Reality provides
+    DPI-resistant authentication using uTLS Chrome fingerprinting.
+
+    --reality-shortid, An optional short identifier for Reality authentication.
+    Must match the server's short ID.
 ` + commonHelp
 
 func client(args []string) {
@@ -434,6 +481,8 @@ func client(args []string) {
 	flags.BoolVar(&config.TLS.SkipVerify, "tls-skip-verify", false, "")
 	flags.StringVar(&config.TLS.Cert, "tls-cert", "", "")
 	flags.StringVar(&config.TLS.Key, "tls-key", "", "")
+	flags.StringVar(&config.Reality.PublicKey, "reality-pubkey", "", "")
+	flags.StringVar(&config.Reality.ShortID, "reality-shortid", "", "")
 	flags.Var(&headerFlags{config.Headers}, "header", "")
 	hostname := flags.String("hostname", "", "")
 	sni := flags.String("sni", "", "")

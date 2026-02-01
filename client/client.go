@@ -21,8 +21,10 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/reality"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/chisel/share/tunnel"
+	utls "github.com/refraction-networking/utls"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/proxy"
@@ -43,6 +45,14 @@ type Config struct {
 	TLS              TLSConfig
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error)
 	Verbose          bool
+	Reality          RealityConfig
+}
+
+// RealityConfig for Reality authentication
+type RealityConfig struct {
+	Enabled   bool
+	PublicKey string // Base64-encoded server public key
+	ShortID   string // Optional short identifier
 }
 
 // TLSConfig for a Client
@@ -67,6 +77,10 @@ type Client struct {
 	stop      func()
 	eg        *errgroup.Group
 	tunnel    *tunnel.Tunnel
+	// Reality authentication
+	realityEnabled   bool
+	realityPublicKey [reality.KeySize]byte
+	realityShortID   []byte
 }
 
 // NewClient creates a new client instance
@@ -138,6 +152,22 @@ func NewClient(c *Config) (*Client, error) {
 			return nil, fmt.Errorf("Please specify client BOTH cert and key")
 		}
 		client.tlsConfig = tc
+	}
+	// Configure Reality authentication
+	if c.Reality.Enabled || c.Reality.PublicKey != "" {
+		if c.Reality.PublicKey == "" {
+			return nil, errors.New("Reality public key is required when Reality is enabled")
+		}
+		pubkeyBytes, err := base64.StdEncoding.DecodeString(c.Reality.PublicKey)
+		if err != nil || len(pubkeyBytes) != reality.KeySize {
+			return nil, errors.New("Invalid Reality public key (must be 32 bytes, base64 encoded)")
+		}
+		client.realityEnabled = true
+		copy(client.realityPublicKey[:], pubkeyBytes)
+		if c.Reality.ShortID != "" {
+			client.realityShortID = []byte(c.Reality.ShortID)
+		}
+		client.Infof("Reality authentication enabled")
 	}
 	//validate remotes
 	for _, s := range c.Remotes {
@@ -304,4 +334,75 @@ func (c *Client) Close() error {
 		c.stop()
 	}
 	return nil
+}
+
+// dialUTLS creates a uTLS connection with Chrome fingerprint for DPI evasion
+func (c *Client) dialUTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Dial TCP connection
+	var tcpConn net.Conn
+	var err error
+	if c.config.DialContext != nil {
+		tcpConn, err = c.config.DialContext(ctx, network, addr)
+	} else {
+		d := &net.Dialer{}
+		tcpConn, err = d.DialContext(ctx, network, addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Build uTLS config from standard TLS config
+	utlsConfig := &utls.Config{
+		InsecureSkipVerify: c.tlsConfig != nil && c.tlsConfig.InsecureSkipVerify,
+	}
+	if c.tlsConfig != nil {
+		utlsConfig.RootCAs = c.tlsConfig.RootCAs
+		utlsConfig.ServerName = c.tlsConfig.ServerName
+	}
+
+	// Extract hostname from addr if ServerName not set
+	if utlsConfig.ServerName == "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		utlsConfig.ServerName = host
+	}
+
+	// Create uTLS connection with Chrome fingerprint
+	tlsConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
+
+	// Perform TLS handshake
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("uTLS handshake failed: %w", err)
+	}
+
+	return tlsConn, nil
+}
+
+// getRealityHeaders generates Reality authentication headers
+func (c *Client) getRealityHeaders() (http.Header, error) {
+	headers := make(http.Header)
+
+	// Copy existing headers
+	for k, v := range c.config.Headers {
+		headers[k] = v
+	}
+
+	if !c.realityEnabled {
+		return headers, nil
+	}
+
+	// Create Reality session ID
+	sessionID, clientPubKey, err := reality.CreateSessionID(c.realityPublicKey, c.realityShortID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Reality session ID: %w", err)
+	}
+
+	// Add Reality headers
+	headers.Set("X-Session-Id", base64.StdEncoding.EncodeToString(sessionID[:]))
+	headers.Set("X-Client-Pubkey", base64.StdEncoding.EncodeToString(clientPubKey[:]))
+
+	return headers, nil
 }

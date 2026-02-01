@@ -2,7 +2,9 @@ package chserver
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -16,6 +18,7 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/reality"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/requestlog"
 	"golang.org/x/crypto/ssh"
@@ -32,6 +35,15 @@ type Config struct {
 	Reverse   bool
 	KeepAlive time.Duration
 	TLS       TLSConfig
+	Reality   RealityConfig
+}
+
+// RealityConfig for Reality authentication
+type RealityConfig struct {
+	Enabled    bool
+	PrivateKey string // Base64-encoded private key
+	ShortID    string // Optional short identifier
+	Fallback   string // URL to proxy unauthenticated requests
 }
 
 // Server respresent a chisel service
@@ -45,6 +57,11 @@ type Server struct {
 	sessions     *settings.Users
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+	// Reality authentication
+	realityEnabled    bool
+	realityPrivateKey [reality.KeySize]byte
+	realityShortID    []byte
+	realityFallback   string
 }
 
 var upgrader = websocket.Upgrader{
@@ -139,6 +156,26 @@ func NewServer(c *Config) (*Server, error) {
 	//print when reverse tunnelling is enabled
 	if c.Reverse {
 		server.Infof("Reverse tunnelling enabled")
+	}
+	// Configure Reality authentication
+	if c.Reality.Enabled || c.Reality.PrivateKey != "" {
+		if c.Reality.PrivateKey == "" {
+			return nil, errors.New("Reality private key is required when Reality is enabled")
+		}
+		privkeyBytes, err := base64.StdEncoding.DecodeString(c.Reality.PrivateKey)
+		if err != nil || len(privkeyBytes) != reality.KeySize {
+			return nil, errors.New("Invalid Reality private key (must be 32 bytes, base64 encoded)")
+		}
+		server.realityEnabled = true
+		copy(server.realityPrivateKey[:], privkeyBytes)
+		if c.Reality.ShortID != "" {
+			server.realityShortID = []byte(c.Reality.ShortID)
+		}
+		server.realityFallback = c.Reality.Fallback
+		if server.realityFallback == "" {
+			server.realityFallback = "https://www.microsoft.com"
+		}
+		server.Infof("Reality authentication enabled (fallback: %s)", server.realityFallback)
 	}
 	return server, nil
 }
@@ -241,4 +278,126 @@ func (s *Server) DeleteUser(user string) {
 // Use nil to remove all.
 func (s *Server) ResetUsers(users []*settings.User) {
 	s.users.Reset(users)
+}
+
+// authenticateReality verifies Reality authentication headers.
+// Returns true if authentication succeeds (or Reality is disabled).
+// Returns false if authentication fails (and proxies to fallback).
+func (s *Server) authenticateReality(w http.ResponseWriter, r *http.Request) bool {
+	if !s.realityEnabled {
+		return true // Reality disabled, allow all
+	}
+
+	// Extract session ID from header
+	sessionIDEncoded := r.Header.Get("X-Session-Id")
+	if sessionIDEncoded == "" {
+		s.Debugf("Reality auth: missing session ID header")
+		s.proxyToFallback(w, r)
+		return false
+	}
+
+	sessionIDBytes, err := base64.StdEncoding.DecodeString(sessionIDEncoded)
+	if err != nil || len(sessionIDBytes) != reality.SessionIDSize {
+		s.Debugf("Reality auth: invalid session ID format")
+		s.proxyToFallback(w, r)
+		return false
+	}
+
+	var sessionID [reality.SessionIDSize]byte
+	copy(sessionID[:], sessionIDBytes)
+
+	// Extract client public key from header
+	clientPubKeyHeader := r.Header.Get("X-Client-Pubkey")
+	if clientPubKeyHeader == "" {
+		s.Debugf("Reality auth: missing client public key header")
+		s.proxyToFallback(w, r)
+		return false
+	}
+
+	clientPubKeyBytes, err := base64.StdEncoding.DecodeString(clientPubKeyHeader)
+	if err != nil || len(clientPubKeyBytes) != reality.KeySize {
+		s.Debugf("Reality auth: invalid client public key format")
+		s.proxyToFallback(w, r)
+		return false
+	}
+
+	var clientPubKey [reality.KeySize]byte
+	copy(clientPubKey[:], clientPubKeyBytes)
+
+	// Verify Reality authentication
+	err = reality.VerifySessionID(sessionID, clientPubKey, s.realityPrivateKey, s.realityShortID)
+	if err != nil {
+		s.Debugf("Reality auth failed: %v", err)
+		s.proxyToFallback(w, r)
+		return false
+	}
+
+	s.Debugf("Reality auth succeeded")
+	return true
+}
+
+// proxyToFallback proxies unauthenticated requests to the fallback website (anti-probing)
+func (s *Server) proxyToFallback(w http.ResponseWriter, r *http.Request) {
+	if s.realityFallback == "" {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Parse fallback URL
+	fallbackURL, err := url.Parse(s.realityFallback)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	// Create proxy request
+	proxyURL := s.realityFallback + r.URL.Path
+	if r.URL.RawQuery != "" {
+		proxyURL += "?" + r.URL.RawQuery
+	}
+
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, proxyURL, r.Body)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	// Copy relevant headers (but not Reality-specific ones)
+	for k, v := range r.Header {
+		// Skip internal headers
+		if k == "X-Session-Id" || k == "X-Client-Pubkey" {
+			continue
+		}
+		proxyReq.Header[k] = v
+	}
+
+	// Set appropriate Host header
+	proxyReq.Host = fallbackURL.Host
+
+	// Forward request
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Don't follow redirects
+		},
+	}
+
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		s.Debugf("Fallback proxy error: %v", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+
+	// Write status code
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy response body
+	io.Copy(w, resp.Body)
 }

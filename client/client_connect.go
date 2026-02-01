@@ -84,13 +84,27 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		WriteBufferSize:  settings.EnvInt("WS_BUFF_SIZE", 0),
 		NetDialContext:   c.config.DialContext,
 	}
+
+	// Use uTLS for Reality authentication (Chrome fingerprint)
+	if c.realityEnabled && strings.HasPrefix(c.server, "wss://") {
+		d.NetDialContext = c.dialUTLS
+		d.TLSClientConfig = nil // uTLS handles TLS
+	}
+
 	//optional proxy
 	if p := c.proxyURL; p != nil {
 		if err := c.setProxy(p, &d); err != nil {
 			return false, err
 		}
 	}
-	wsConn, _, err := d.DialContext(ctx, c.server, c.config.Headers)
+
+	// Get headers including Reality authentication
+	headers, err := c.getRealityHeaders()
+	if err != nil {
+		return false, err
+	}
+
+	wsConn, _, err := d.DialContext(ctx, c.server, headers)
 	if err != nil {
 		return false, err
 	}

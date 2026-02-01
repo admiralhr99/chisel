@@ -49,6 +49,11 @@ func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
 
 // handleWebsocket is responsible for handling the websocket connection
 func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
+	// Verify Reality authentication before upgrading to WebSocket
+	if !s.authenticateReality(w, req) {
+		return // Authentication failed, already handled by proxyToFallback
+	}
+
 	id := atomic.AddInt32(&s.sessCount, 1)
 	l := s.Fork("session#%d", id)
 	wsConn, err := upgrader.Upgrade(w, req, nil)

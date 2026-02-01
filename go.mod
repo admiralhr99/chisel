@@ -17,7 +17,10 @@ require (
 
 require (
 	github.com/andrew-d/go-termutil v0.0.0-20150726205930-009166a695a2 // indirect
+	github.com/andybalholm/brotli v1.0.6 // indirect
+	github.com/cloudflare/circl v1.3.7 // indirect
 	github.com/jpillora/ansi v1.0.3 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/tomasen/realip v0.0.0-20180522021738-f0c99a92ddce // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
