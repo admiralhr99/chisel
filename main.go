@@ -29,9 +29,11 @@ var help = `
   Version: ` + chshare.BuildVersion + ` (` + runtime.Version() + `)
 
   Commands:
-    server - runs chisel in server mode
-    client - runs chisel in client mode
-    genkey - generates Reality keypair for authentication
+    server       - runs chisel in server mode
+    client       - runs chisel in client mode
+    genkey       - generates Reality keypair for authentication
+    relay-server - fast TCP relay server (no SSH overhead)
+    relay-client - fast TCP relay client (no SSH overhead)
 
   Read more:
     https://github.com/jpillora/chisel
@@ -67,6 +69,10 @@ func main() {
 		client(args)
 	case "genkey":
 		genkey()
+	case "relay-server":
+		relayServer(args)
+	case "relay-client":
+		relayClient(args)
 	default:
 		fmt.Print(help)
 		os.Exit(0)
