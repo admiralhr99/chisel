@@ -32,3 +32,7 @@ _testmain.go
 *.exe
 *.test
 *.prof
+chisel-linux-amd64
+chisel-windows-amd64.exe
+chisel-darwin-amd64
+chisel
