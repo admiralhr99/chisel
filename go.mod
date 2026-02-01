@@ -22,6 +22,7 @@ require (
 	github.com/jpillora/ansi v1.0.3 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/tomasen/realip v0.0.0-20180522021738-f0c99a92ddce // indirect
+	github.com/xtaci/smux v1.5.55 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jpillora/chisel/share/reality"
+	"github.com/xtaci/smux"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -343,11 +344,8 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 
 	// Handle different commands
 	if strings.HasPrefix(cmd, "R:") {
-		// Reverse mode: R:<listen-port>:<forward-target>
+		// Reverse mode with SMUX: R:<listen-port>:<forward-target>
 		handleReverseRegister(conn, id, cmd[2:], verbose)
-	} else if strings.HasPrefix(cmd, "C:") {
-		// Data connection for reverse: C:<listen-port>
-		handleReverseData(conn, id, cmd[2:], verbose)
 	} else {
 		// Forward mode: direct target address
 		handleForwardConnection(conn, id, cmd, verbose)
@@ -380,7 +378,19 @@ func handleForwardConnection(conn net.Conn, id int64, target string, verbose boo
 	}
 }
 
-// handleReverseRegister handles reverse mode registration
+// smux config optimized for speed
+func getSmuxConfig() *smux.Config {
+	cfg := smux.DefaultConfig()
+	cfg.Version = 2
+	cfg.KeepAliveInterval = 10 * time.Second
+	cfg.KeepAliveTimeout = 30 * time.Second
+	cfg.MaxFrameSize = 32 * 1024        // 32KB frames
+	cfg.MaxReceiveBuffer = 4 * 1024 * 1024 // 4MB buffer
+	cfg.MaxStreamBuffer = 2 * 1024 * 1024  // 2MB per stream
+	return cfg
+}
+
+// handleReverseRegister handles reverse mode registration with SMUX multiplexing
 // cmd format: <listen-port>:<forward-target>
 func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 	parts := strings.SplitN(cmd, ":", 2)
@@ -404,16 +414,35 @@ func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 		conn.Close()
 		return
 	}
+	globalReverse.Unlock()
 
 	// Start listener
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		globalReverse.Unlock()
 		log.Printf("[%d] Failed to listen on %s: %v", id, listenAddr, err)
 		conn.Close()
 		return
 	}
 
+	log.Printf("[%d] Reverse tunnel: listening on %s -> client -> %s", id, listenAddr, forwardAddr)
+
+	// Send OK to client before starting smux
+	conn.Write([]byte("OK\n"))
+
+	// Create smux session - SERVER mode (we accept streams from client)
+	// Client will open streams, server accepts them
+	muxSession, err := smux.Server(conn, getSmuxConfig())
+	if err != nil {
+		log.Printf("[%d] Failed to create smux session: %v", id, err)
+		listener.Close()
+		conn.Close()
+		return
+	}
+
+	log.Printf("[%d] SMUX session established (multiplexed)", id)
+
+	// Track session
+	globalReverse.Lock()
 	session := &reverseSession{
 		listener:    listener,
 		controlConn: conn,
@@ -421,53 +450,45 @@ func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 		connQueue:   make(chan net.Conn, 100),
 		verbose:     verbose,
 	}
-
 	globalReverse.listeners[listenPort] = session
 	globalReverse.Unlock()
 
-	log.Printf("[%d] Reverse tunnel: listening on %s -> client -> %s", id, listenAddr, forwardAddr)
+	var streamID int64
 
-	// Send OK to client
-	conn.Write([]byte("OK\n"))
-
-	// Accept incoming connections
-	go func() {
-		for {
-			incomingConn, err := listener.Accept()
-			if err != nil {
-				if verbose {
-					log.Printf("[%d] Reverse accept error: %v", id, err)
-				}
-				break
-			}
-
-			// Signal client to create data connection
-			_, err = conn.Write([]byte("NEW\n"))
-			if err != nil {
-				if verbose {
-					log.Printf("[%d] Failed to signal client: %v", id, err)
-				}
-				incomingConn.Close()
-				break
-			}
-
-			// Queue the connection
-			select {
-			case session.connQueue <- incomingConn:
-			default:
-				// Queue full, drop connection
-				incomingConn.Close()
-			}
-		}
-	}()
-
-	// Wait for control connection to close
-	buf := make([]byte, 1)
+	// Accept incoming connections and relay through smux streams
 	for {
-		_, err := conn.Read(buf)
+		incomingConn, err := listener.Accept()
 		if err != nil {
+			if verbose {
+				log.Printf("[%d] Reverse accept error: %v", id, err)
+			}
 			break
 		}
+
+		// Open smux stream to client (FAST - no new TLS handshake!)
+		stream, err := muxSession.OpenStream()
+		if err != nil {
+			if verbose {
+				log.Printf("[%d] Failed to open smux stream: %v", id, err)
+			}
+			incomingConn.Close()
+			break
+		}
+
+		sid := atomic.AddInt64(&streamID, 1)
+		if verbose {
+			log.Printf("[%d] Stream %d: %s -> client -> %s", id, sid, incomingConn.RemoteAddr(), forwardAddr)
+		}
+
+		// Relay in goroutine
+		go func(incoming net.Conn, stream *smux.Stream, sid int64) {
+			defer incoming.Close()
+			defer stream.Close()
+			sent, recv := relay(incoming, stream)
+			if verbose {
+				log.Printf("[%d] Stream %d closed: sent=%d recv=%d", id, sid, sent, recv)
+			}
+		}(incomingConn, stream, sid)
 	}
 
 	// Cleanup
@@ -475,6 +496,7 @@ func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 	delete(globalReverse.listeners, listenPort)
 	globalReverse.Unlock()
 
+	muxSession.Close()
 	listener.Close()
 	close(session.connQueue)
 
@@ -484,43 +506,6 @@ func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 	}
 
 	log.Printf("[%d] Reverse tunnel closed for port %s", id, listenPort)
-}
-
-// handleReverseData handles a data connection for reverse mode
-func handleReverseData(conn net.Conn, id int64, listenPort string, verbose bool) {
-	globalReverse.RLock()
-	session, exists := globalReverse.listeners[listenPort]
-	globalReverse.RUnlock()
-
-	if !exists {
-		if verbose {
-			log.Printf("[%d] No reverse session for port %s", id, listenPort)
-		}
-		conn.Close()
-		return
-	}
-
-	// Get incoming connection from queue
-	select {
-	case incomingConn := <-session.connQueue:
-		if verbose {
-			log.Printf("[%d] Reverse relay: %s -> client -> %s", id, incomingConn.RemoteAddr(), session.forwardAddr)
-		}
-		// Relay between incoming and client's data connection
-		go func() {
-			defer conn.Close()
-			defer incomingConn.Close()
-			sent, recv := relay(incomingConn, conn)
-			if verbose {
-				log.Printf("[%d] Reverse relay closed: sent=%d recv=%d", id, sent, recv)
-			}
-		}()
-	case <-time.After(10 * time.Second):
-		if verbose {
-			log.Printf("[%d] Reverse data timeout for port %s", id, listenPort)
-		}
-		conn.Close()
-	}
 }
 
 // relayClient runs the fast relay client
@@ -669,7 +654,7 @@ type relayClientConfig struct {
 	verbose         bool
 }
 
-// runReverseClient runs the reverse mode client
+// runReverseClient runs the reverse mode client with SMUX multiplexing
 // mapping format: <server-listen-port>:<local-host>:<local-port>
 func runReverseClient(mapping string, cfg *relayClientConfig) {
 	parts := strings.SplitN(mapping, ":", 3)
@@ -686,14 +671,14 @@ func runReverseClient(mapping string, cfg *relayClientConfig) {
 		localAddr = parts[1] + ":" + parts[2]
 	}
 
-	log.Printf("relay-client: Reverse mode")
+	log.Printf("relay-client: Reverse mode with SMUX multiplexing")
 	log.Printf("relay-client: Server %s listens on :%s -> tunnel -> local %s", cfg.server, listenPort, localAddr)
 	if cfg.realityEnabled {
 		log.Printf("relay-client: Reality auth enabled, SNI: %s", cfg.sni)
 	}
 
 	for {
-		// Connect control connection
+		// Connect to server
 		controlConn, err := dialServer(cfg)
 		if err != nil {
 			log.Printf("Failed to connect: %v, retrying in 5s...", err)
@@ -722,85 +707,59 @@ func runReverseClient(mapping string, cfg *relayClientConfig) {
 		}
 		controlConn.SetReadDeadline(time.Time{})
 
-		log.Printf("relay-client: Reverse tunnel established, server listening on :%s", listenPort)
+		// Create smux session - CLIENT mode (server opens streams, we accept them)
+		muxSession, err := smux.Client(controlConn, getSmuxConfig())
+		if err != nil {
+			log.Printf("Failed to create smux session: %v", err)
+			controlConn.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
 
-		// Handle signals
-		handleReverseClientSignals(controlConn, listenPort, localAddr, cfg)
+		log.Printf("relay-client: SMUX session established, server listening on :%s", listenPort)
 
-		log.Printf("relay-client: Control connection lost, reconnecting...")
+		// Accept streams from server and relay to local service
+		var streamID int64
+		for {
+			stream, err := muxSession.AcceptStream()
+			if err != nil {
+				if cfg.verbose {
+					log.Printf("SMUX session error: %v", err)
+				}
+				break
+			}
+
+			sid := atomic.AddInt64(&streamID, 1)
+
+			// Connect to local service
+			go func(stream *smux.Stream, sid int64) {
+				defer stream.Close()
+
+				localConn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
+				if err != nil {
+					if cfg.verbose {
+						log.Printf("Stream %d: Failed to connect to local %s: %v", sid, localAddr, err)
+					}
+					return
+				}
+				defer localConn.Close()
+
+				if cfg.verbose {
+					log.Printf("Stream %d: server -> tunnel -> %s", sid, localAddr)
+				}
+
+				sent, recv := relay(stream, localConn)
+
+				if cfg.verbose {
+					log.Printf("Stream %d: closed, sent=%d recv=%d", sid, sent, recv)
+				}
+			}(stream, sid)
+		}
+
+		muxSession.Close()
+		log.Printf("relay-client: Connection lost, reconnecting...")
 		time.Sleep(1 * time.Second)
 	}
-}
-
-func handleReverseClientSignals(controlConn net.Conn, listenPort, localAddr string, cfg *relayClientConfig) {
-	defer controlConn.Close()
-
-	reader := make([]byte, 64)
-	for {
-		n, err := controlConn.Read(reader)
-		if err != nil {
-			if cfg.verbose {
-				log.Printf("Control connection error: %v", err)
-			}
-			return
-		}
-
-		msg := strings.TrimSpace(string(reader[:n]))
-		if cfg.verbose {
-			log.Printf("Control signal: %s", msg)
-		}
-
-		// Handle NEW signal - create data connection
-		if strings.Contains(msg, "NEW") {
-			// Count how many NEW signals (could be multiple)
-			count := strings.Count(msg, "NEW")
-			for i := 0; i < count; i++ {
-				go createReverseDataConnection(listenPort, localAddr, cfg)
-			}
-		}
-	}
-}
-
-func createReverseDataConnection(listenPort, localAddr string, cfg *relayClientConfig) {
-	// Connect to server
-	serverConn, err := dialServer(cfg)
-	if err != nil {
-		if cfg.verbose {
-			log.Printf("Failed to create data connection: %v", err)
-		}
-		return
-	}
-
-	// Send data connection command: C:<listen-port>
-	cmd := fmt.Sprintf("C:%s", listenPort)
-	if err := sendCommand(serverConn, cmd, cfg); err != nil {
-		if cfg.verbose {
-			log.Printf("Failed to send data command: %v", err)
-		}
-		serverConn.Close()
-		return
-	}
-
-	// Connect to local service
-	localConn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
-	if err != nil {
-		if cfg.verbose {
-			log.Printf("Failed to connect to local %s: %v", localAddr, err)
-		}
-		serverConn.Close()
-		return
-	}
-
-	if cfg.verbose {
-		log.Printf("Reverse data: server:%s -> %s", listenPort, localAddr)
-	}
-
-	// Relay
-	go func() {
-		defer serverConn.Close()
-		defer localConn.Close()
-		relay(serverConn, localConn)
-	}()
 }
 
 // dialServer creates a connection to the relay server with DPI evasion
@@ -813,6 +772,11 @@ func dialServer(cfg *relayClientConfig) (net.Conn, error) {
 		tcpConn, err := net.DialTimeout("tcp", cfg.server, dialTimeout)
 		if err != nil {
 			return nil, err
+		}
+
+		// Enable TCP_NODELAY for lower latency
+		if tc, ok := tcpConn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
 		}
 
 		// Use SNI for DPI evasion - looks like connecting to legitimate site
