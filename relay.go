@@ -51,6 +51,8 @@ var relayHelp = `
     --sni              SNI hostname to send (default: www.microsoft.com)
                        Use popular sites: google.com, microsoft.com, apple.com
     --tls-skip-verify  Skip TLS certificate verification (required for auto-cert)
+    --mux              Number of parallel connections (1-8, default: 1)
+                       Use --mux 4 for better web browsing performance
     -v                 Verbose logging
 
   DPI EVASION:
@@ -82,15 +84,10 @@ var relayHelp = `
 `
 
 const (
-	bufferSize    = 64 * 1024 // 64KB buffer for speed
+	bufferSize    = 32 * 1024 // 32KB buffer (balanced latency/throughput)
 	authTimeout   = 10 * time.Second
 	dialTimeout   = 10 * time.Second
 	maxTargetLen  = 256
-
-	// Protocol commands
-	cmdForward = "F" // Forward mode: F<target>
-	cmdReverse = "R" // Reverse mode: R<listen-port>:<forward-target>
-	cmdConnect = "C" // Data connection for reverse: C<conn-id>
 )
 
 // reverseListener manages reverse tunnel listeners
@@ -378,15 +375,15 @@ func handleForwardConnection(conn net.Conn, id int64, target string, verbose boo
 	}
 }
 
-// smux config optimized for speed
+// smux config optimized for low latency (web browsing, interactive)
 func getSmuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
-	cfg.KeepAliveInterval = 10 * time.Second
-	cfg.KeepAliveTimeout = 30 * time.Second
-	cfg.MaxFrameSize = 32 * 1024        // 32KB frames
-	cfg.MaxReceiveBuffer = 4 * 1024 * 1024 // 4MB buffer
-	cfg.MaxStreamBuffer = 2 * 1024 * 1024  // 2MB per stream
+	cfg.KeepAliveInterval = 5 * time.Second   // Faster keepalive
+	cfg.KeepAliveTimeout = 15 * time.Second   // Faster timeout detection
+	cfg.MaxFrameSize = 16 * 1024              // 16KB frames (smaller = lower latency)
+	cfg.MaxReceiveBuffer = 512 * 1024         // 512KB buffer (smaller for lower latency)
+	cfg.MaxStreamBuffer = 256 * 1024          // 256KB per stream
 	return cfg
 }
 
@@ -465,6 +462,11 @@ func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 			break
 		}
 
+		// Enable TCP_NODELAY for lower latency
+		if tc, ok := incomingConn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+
 		// Open smux stream to client (FAST - no new TLS handshake!)
 		stream, err := muxSession.OpenStream()
 		if err != nil {
@@ -517,6 +519,7 @@ func relayClient(args []string) {
 	sni := flags.String("sni", "www.microsoft.com", "")
 	tlsSkipVerify := flags.Bool("tls-skip-verify", false, "")
 	noTLS := flags.Bool("no-tls", false, "")
+	muxConns := flags.Int("mux", 1, "")  // Number of parallel SMUX connections
 	verbose := flags.Bool("v", false, "")
 
 	flags.Usage = func() {
@@ -567,6 +570,14 @@ func relayClient(args []string) {
 	}
 
 	// Create client config
+	numMux := *muxConns
+	if numMux < 1 {
+		numMux = 1
+	}
+	if numMux > 8 {
+		numMux = 8  // Max 8 parallel connections
+	}
+
 	clientCfg := &relayClientConfig{
 		server:          server,
 		pubKey:          pubKey,
@@ -576,6 +587,7 @@ func relayClient(args []string) {
 		tlsSkipVerify:   *tlsSkipVerify,
 		sni:             *sni,
 		verbose:         *verbose,
+		muxConns:        numMux,
 	}
 
 	// Check if reverse mode
@@ -652,6 +664,7 @@ type relayClientConfig struct {
 	tlsSkipVerify   bool
 	sni             string
 	verbose         bool
+	muxConns        int  // Number of parallel SMUX connections
 }
 
 // runReverseClient runs the reverse mode client with SMUX multiplexing
@@ -743,6 +756,11 @@ func runReverseClient(mapping string, cfg *relayClientConfig) {
 					return
 				}
 				defer localConn.Close()
+
+				// Enable TCP_NODELAY for lower latency
+				if tc, ok := localConn.(*net.TCPConn); ok {
+					tc.SetNoDelay(true)
+				}
 
 				if cfg.verbose {
 					log.Printf("Stream %d: server -> tunnel -> %s", sid, localAddr)
