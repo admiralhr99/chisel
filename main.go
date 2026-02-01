@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -78,6 +80,13 @@ func genkey() {
 		log.Fatalf("Failed to generate keypair: %v", err)
 	}
 
+	// Generate random short ID (8 bytes, hex encoded = 16 chars)
+	shortIDBytes := make([]byte, 8)
+	if _, err := rand.Read(shortIDBytes); err != nil {
+		log.Fatalf("Failed to generate short ID: %v", err)
+	}
+	shortID := hex.EncodeToString(shortIDBytes)
+
 	privB64 := base64.StdEncoding.EncodeToString(priv[:])
 	pubB64 := base64.StdEncoding.EncodeToString(pub[:])
 
@@ -85,9 +94,13 @@ func genkey() {
 	fmt.Println("================================")
 	fmt.Printf("Private Key: %s\n", privB64)
 	fmt.Printf("Public Key:  %s\n", pubB64)
+	fmt.Printf("Short ID:    %s\n", shortID)
 	fmt.Println()
-	fmt.Println("Server usage: chisel server --reality-privkey \"" + privB64 + "\"")
-	fmt.Println("Client usage: chisel client --reality-pubkey \"" + pubB64 + "\" ...")
+	fmt.Println("Server usage:")
+	fmt.Printf("  chisel server --reality-privkey \"%s\" --reality-shortid \"%s\"\n", privB64, shortID)
+	fmt.Println()
+	fmt.Println("Client usage:")
+	fmt.Printf("  chisel client --reality-pubkey \"%s\" --reality-shortid \"%s\" wss://server:443 ...\n", pubB64, shortID)
 }
 
 var commonHelp = `

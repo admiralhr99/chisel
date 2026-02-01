@@ -85,9 +85,16 @@ type Client struct {
 
 // NewClient creates a new client instance
 func NewClient(c *Config) (*Client, error) {
-	//apply default scheme
-	if !strings.HasPrefix(c.Server, "http") {
+	//apply default scheme (support http://, https://, ws://, wss://)
+	if !strings.HasPrefix(c.Server, "http") && !strings.HasPrefix(c.Server, "ws") {
 		c.Server = "http://" + c.Server
+	}
+	// Convert ws:// to http:// and wss:// to https:// for URL parsing
+	// (will be converted back to ws/wss later)
+	if strings.HasPrefix(c.Server, "ws://") {
+		c.Server = "http://" + strings.TrimPrefix(c.Server, "ws://")
+	} else if strings.HasPrefix(c.Server, "wss://") {
+		c.Server = "https://" + strings.TrimPrefix(c.Server, "wss://")
 	}
 	if c.MaxRetryInterval < time.Second {
 		c.MaxRetryInterval = 5 * time.Minute
