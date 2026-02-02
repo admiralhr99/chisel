@@ -923,10 +923,13 @@ func relay(c1, c2 net.Conn) (int64, int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Use io.Copy which can use splice() on Linux for TCP-to-TCP
+	// For TLS/SMUX it falls back to efficient buffered copy
+
 	// c1 -> c2
 	go func() {
 		defer wg.Done()
-		n, _ := io.CopyBuffer(c2, c1, make([]byte, bufferSize))
+		n, _ := io.Copy(c2, c1)
 		sent = n
 		closeWrite(c2)
 	}()
@@ -934,7 +937,7 @@ func relay(c1, c2 net.Conn) (int64, int64) {
 	// c2 -> c1
 	go func() {
 		defer wg.Done()
-		n, _ := io.CopyBuffer(c1, c2, make([]byte, bufferSize))
+		n, _ := io.Copy(c1, c2)
 		recv = n
 		closeWrite(c1)
 	}()
