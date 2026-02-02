@@ -1,3 +1,6 @@
+// Fast TCP relay with Reality authentication - NO SSH overhead
+// Optimized for low latency real-time traffic (Telegram, browsing, etc.)
+
 package main
 
 import (
@@ -15,6 +18,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	mrand "math/rand"
 	"net"
 	"os"
 	"strings"
@@ -23,19 +27,15 @@ import (
 	"time"
 
 	"github.com/jpillora/chisel/share/reality"
-	"github.com/xtaci/smux"
 	utls "github.com/refraction-networking/utls"
 )
-
-// Fast TCP relay with Reality authentication - NO SSH overhead
-// Optimized based on Backhaul implementation patterns
 
 var relayHelp = `
   Usage: chisel relay-server [options]
          chisel relay-client [options] <server> <local>:<remote>
 
   FAST TCP relay with Reality authentication (no SSH overhead).
-  Designed to evade DPI by looking like normal HTTPS traffic.
+  Optimized for low latency real-time traffic.
 
   relay-server options:
     --port, -p         Port to listen on (default: 443)
@@ -43,95 +43,88 @@ var relayHelp = `
     --tls-key          TLS key file (auto-generated if not provided)
     --tls-domain       Domain for auto-generated cert (default: www.microsoft.com)
     --reality-privkey  Reality private key (from 'chisel genkey')
-    --reality-shortid  Reality short ID
-    --mode             Performance mode: latency, throughput, balanced (default: balanced)
+    --reality-shortid  Reality short ID (comma-separated for rotation)
     -v                 Verbose logging
 
   relay-client options:
     --reality-pubkey   Reality public key
     --reality-shortid  Reality short ID
     --sni              SNI hostname to send (default: www.microsoft.com)
-                       Use popular sites: google.com, microsoft.com, apple.com
-    --tls-skip-verify  Skip TLS certificate verification (required for auto-cert)
-    --mux-sessions     Number of parallel SMUX sessions (1-8, default: 2)
-    --pool-size        Connection pool size for forward mode (default: 4)
-    --mode             Performance mode: latency, throughput, balanced (default: balanced)
+    --fingerprint      TLS fingerprint: chrome, firefox, safari, random (default: chrome)
+    --tls-skip-verify  Skip TLS certificate verification
     -v                 Verbose logging
 
-  DPI EVASION:
-    - Uses uTLS with Chrome browser fingerprint
-    - SNI spoofing to look like connecting to legitimate sites
-    - ALPN negotiation (h2, http/1.1) like real browsers
-    - Auto-generates TLS cert if none provided
-
-  FORWARD MODE (client listens, server connects to target):
-    chisel relay-client --sni google.com server:443 30949:localhost:30949
-
-  REVERSE MODE (server listens, client connects to target):
-    chisel relay-client --sni google.com server:443 R:30949:localhost:30949
-
   Examples:
-    # === SERVER (Iran - has open IP) ===
-    chisel relay-server -p 443 \
-      --reality-privkey "..." --reality-shortid "..." -v
+    # Server (Iran)
+    chisel relay-server -p 443 --reality-privkey "..." --reality-shortid "abc123" -v
 
-    # === CLIENT (Germany - behind NAT, has V2Ray on 30949) ===
-    # Reverse mode: Iran listens on 30949, forwards to Germany's V2Ray
-    chisel relay-client \
-      --reality-pubkey "..." --reality-shortid "..." \
+    # Client reverse mode (Germany -> Iran)
+    chisel relay-client --reality-pubkey "..." --reality-shortid "abc123" \
       --sni www.google.com --tls-skip-verify \
-      iran-ip:443 R:30949:localhost:30949 -v
+      iran:443 R:30949:localhost:30949
 
-    # Traffic flow: User -> Iran:30949 -> [TLS tunnel] -> Germany:30949 (V2Ray)
-
+    # Traffic: User -> Iran:30949 -> tunnel -> Germany:30949 (V2Ray)
 `
 
 const (
-	authTimeout   = 10 * time.Second
-	dialTimeout   = 10 * time.Second
-	maxTargetLen  = 256
+	authTimeout  = 10 * time.Second
+	dialTimeout  = 5 * time.Second  // Reduced for faster failover
+	copyBufSize  = 8 * 1024         // 8KB - small for low latency
+	maxTargetLen = 256
 )
 
-// Performance modes (inspired by Backhaul)
-type perfMode int
+// TLS fingerprint types
+type fingerprint int
 
 const (
-	modeBalanced   perfMode = iota
-	modeLatency             // Optimized for web browsing
-	modeThroughput          // Optimized for downloads/streaming
+	fpChrome fingerprint = iota
+	fpFirefox
+	fpSafari
+	fpRandom
 )
 
-func parsePerfMode(s string) perfMode {
+func parseFingerprint(s string) fingerprint {
 	switch strings.ToLower(s) {
-	case "latency", "low-latency":
-		return modeLatency
-	case "throughput", "high-throughput":
-		return modeThroughput
+	case "firefox":
+		return fpFirefox
+	case "safari":
+		return fpSafari
+	case "random":
+		return fpRandom
 	default:
-		return modeBalanced
+		return fpChrome
 	}
 }
 
-// reverseListener manages reverse tunnel listeners
-type reverseListener struct {
-	sync.RWMutex
-	listeners map[string]*reverseSession
+func getClientHelloID(fp fingerprint) utls.ClientHelloID {
+	switch fp {
+	case fpFirefox:
+		return utls.HelloFirefox_Auto
+	case fpSafari:
+		return utls.HelloSafari_Auto
+	case fpRandom:
+		return utls.HelloRandomized
+	default:
+		return utls.HelloChrome_Auto
+	}
 }
 
+// reverseSession tracks a reverse tunnel
 type reverseSession struct {
 	listener    net.Listener
 	controlConn net.Conn
-	forwardAddr string
-	connQueue   chan net.Conn
-	verbose     bool
-	mode        perfMode
+	localAddr   string
+	done        chan struct{}
 }
 
-var globalReverse = &reverseListener{
-	listeners: make(map[string]*reverseSession),
-}
+var (
+	globalReverse = struct {
+		sync.RWMutex
+		sessions map[string]*reverseSession
+	}{sessions: make(map[string]*reverseSession)}
+)
 
-// generateSelfSignedCert creates a self-signed certificate for TLS
+// generateSelfSignedCert creates a self-signed certificate
 func generateSelfSignedCert(domain string) (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -166,7 +159,7 @@ func generateSelfSignedCert(domain string) (tls.Certificate, error) {
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
-// relayServer runs the fast relay server
+// relayServer runs the relay server
 func relayServer(args []string) {
 	flags := flag.NewFlagSet("relay-server", flag.ContinueOnError)
 
@@ -178,7 +171,6 @@ func relayServer(args []string) {
 	noTLS := flags.Bool("no-tls", false, "")
 	realityPrivkey := flags.String("reality-privkey", "", "")
 	realityShortID := flags.String("reality-shortid", "", "")
-	modeStr := flags.String("mode", "balanced", "")
 	verbose := flags.Bool("v", false, "")
 
 	flags.Usage = func() {
@@ -193,7 +185,7 @@ func relayServer(args []string) {
 
 	// Parse Reality key
 	var privKey [32]byte
-	var shortID []byte
+	var shortIDs [][]byte
 	realityEnabled := false
 
 	if *realityPrivkey != "" {
@@ -203,35 +195,37 @@ func relayServer(args []string) {
 		}
 		copy(privKey[:], keyBytes)
 		realityEnabled = true
+
+		// Support multiple short IDs (comma-separated) for rotation
 		if *realityShortID != "" {
-			shortID = []byte(*realityShortID)
+			for _, id := range strings.Split(*realityShortID, ",") {
+				id = strings.TrimSpace(id)
+				if id != "" {
+					shortIDs = append(shortIDs, []byte(id))
+				}
+			}
 		}
 	}
 
 	// Setup listener
 	var listener net.Listener
 	var err error
-
 	addr := "0.0.0.0:" + *port
 
 	if *noTLS {
-		// Raw TCP (not recommended - DPI can detect)
 		listener, err = net.Listen("tcp", addr)
 		if err != nil {
 			log.Fatalf("Failed to listen: %v", err)
 		}
-		log.Printf("relay-server: Listening on %s (no TLS - NOT DPI resistant!)", addr)
+		log.Printf("relay-server: Listening on %s (no TLS)", addr)
 	} else {
-		// TLS mode (recommended for DPI evasion)
 		var cert tls.Certificate
 		if *tlsCert != "" && *tlsKey != "" {
 			cert, err = tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 			if err != nil {
 				log.Fatalf("Failed to load TLS cert: %v", err)
 			}
-			log.Printf("relay-server: Using provided TLS certificate")
 		} else {
-			// Auto-generate self-signed cert
 			cert, err = generateSelfSignedCert(*tlsDomain)
 			if err != nil {
 				log.Fatalf("Failed to generate TLS cert: %v", err)
@@ -241,25 +235,21 @@ func relayServer(args []string) {
 
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"}, // ALPN - looks like HTTP/2
+			NextProtos:   []string{"h2", "http/1.1"},
 			MinVersion:   tls.VersionTLS12,
 		}
 		listener, err = tls.Listen("tcp", addr, tlsConfig)
 		if err != nil {
 			log.Fatalf("Failed to listen: %v", err)
 		}
-		log.Printf("relay-server: Listening on %s (TLS with ALPN h2)", addr)
+		log.Printf("relay-server: Listening on %s (TLS)", addr)
 	}
 
 	if realityEnabled {
-		log.Printf("relay-server: Reality authentication enabled")
+		log.Printf("relay-server: Reality auth enabled, %d short ID(s)", len(shortIDs))
 	}
 
-	mode := parsePerfMode(*modeStr)
-	log.Printf("relay-server: Performance mode: %s", *modeStr)
-
 	var connID int64
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -267,29 +257,32 @@ func relayServer(args []string) {
 			continue
 		}
 
-		// Apply TCP options for performance
-		setTCPOptions(conn, mode)
-
 		id := atomic.AddInt64(&connID, 1)
-		go handleRelayConnection(conn, id, privKey, shortID, realityEnabled, *verbose, mode)
+		go handleServerConn(conn, id, privKey, shortIDs, realityEnabled, *verbose)
 	}
 }
 
-func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []byte, realityEnabled, verbose bool, mode perfMode) {
+func handleServerConn(conn net.Conn, id int64, privKey [32]byte, shortIDs [][]byte, realityEnabled, verbose bool) {
+	// Set TCP options for low latency
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	conn.SetDeadline(time.Now().Add(authTimeout))
 
-	// Read auth header (if Reality enabled)
-	// Protocol: [2 bytes: auth len][auth data][1 byte: cmd len][cmd string]
+	// Reality authentication
 	if realityEnabled {
-		// Read auth length
 		authLenBuf := make([]byte, 2)
 		if _, err := io.ReadFull(conn, authLenBuf); err != nil {
 			if verbose {
-				log.Printf("[%d] Failed to read auth length: %v", id, err)
+				log.Printf("[%d] Auth read failed: %v", id, err)
 			}
 			conn.Close()
 			return
 		}
+
 		authLen := binary.BigEndian.Uint16(authLenBuf)
 		if authLen < 64 || authLen > 128 {
 			if verbose {
@@ -299,34 +292,37 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 			return
 		}
 
-		// Read auth data (sessionID + clientPubKey)
 		authData := make([]byte, authLen)
 		if _, err := io.ReadFull(conn, authData); err != nil {
 			if verbose {
-				log.Printf("[%d] Failed to read auth: %v", id, err)
+				log.Printf("[%d] Auth data read failed: %v", id, err)
 			}
 			conn.Close()
 			return
 		}
 
-		// Parse session ID (32 bytes) and client public key (32 bytes)
-		if len(authData) < 64 {
-			if verbose {
-				log.Printf("[%d] Auth data too short", id)
-			}
-			conn.Close()
-			return
-		}
-
-		var sessionID [32]byte
-		var clientPubKey [32]byte
+		var sessionID, clientPubKey [32]byte
 		copy(sessionID[:], authData[:32])
 		copy(clientPubKey[:], authData[32:64])
 
-		// Verify Reality auth
-		if err := reality.VerifySessionID(sessionID, clientPubKey, privKey, shortID); err != nil {
+		// Try all short IDs (supports rotation)
+		authOK := false
+		for _, shortID := range shortIDs {
+			if err := reality.VerifySessionID(sessionID, clientPubKey, privKey, shortID); err == nil {
+				authOK = true
+				break
+			}
+		}
+		// Also try with empty shortID if none matched
+		if !authOK && len(shortIDs) == 0 {
+			if err := reality.VerifySessionID(sessionID, clientPubKey, privKey, nil); err == nil {
+				authOK = true
+			}
+		}
+
+		if !authOK {
 			if verbose {
-				log.Printf("[%d] Reality auth failed: %v", id, err)
+				log.Printf("[%d] Reality auth failed", id)
 			}
 			conn.Close()
 			return
@@ -337,275 +333,243 @@ func handleRelayConnection(conn net.Conn, id int64, privKey [32]byte, shortID []
 		}
 	}
 
-	// Read command length
+	// Read command
 	cmdLenBuf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, cmdLenBuf); err != nil {
-		if verbose {
-			log.Printf("[%d] Failed to read cmd length: %v", id, err)
-		}
-		conn.Close()
-		return
-	}
-	cmdLen := int(cmdLenBuf[0])
-	if cmdLen == 0 || cmdLen > maxTargetLen {
-		if verbose {
-			log.Printf("[%d] Invalid cmd length: %d", id, cmdLen)
-		}
 		conn.Close()
 		return
 	}
 
-	// Read command
+	cmdLen := int(cmdLenBuf[0])
+	if cmdLen == 0 || cmdLen > maxTargetLen {
+		conn.Close()
+		return
+	}
+
 	cmdBuf := make([]byte, cmdLen)
 	if _, err := io.ReadFull(conn, cmdBuf); err != nil {
-		if verbose {
-			log.Printf("[%d] Failed to read cmd: %v", id, err)
-		}
 		conn.Close()
 		return
 	}
 	cmd := string(cmdBuf)
 
-	// Clear deadline
 	conn.SetDeadline(time.Time{})
 
-	// Handle different commands
 	if strings.HasPrefix(cmd, "R:") {
-		// Reverse mode with SMUX: R:<listen-port>:<forward-target>
-		handleReverseRegister(conn, id, cmd[2:], verbose, mode)
+		handleReverseRegister(conn, id, cmd[2:], verbose)
+	} else if strings.HasPrefix(cmd, "T:") {
+		// Tunnel connection from client for reverse mode
+		handleTunnelConn(conn, id, cmd[2:], verbose)
 	} else {
-		// Forward mode: direct target address
-		handleForwardConnection(conn, id, cmd, verbose, mode)
+		handleForward(conn, id, cmd, verbose)
 	}
 }
 
-// handleForwardConnection handles forward mode - connect to target and relay
-func handleForwardConnection(conn net.Conn, id int64, target string, verbose bool, mode perfMode) {
+// handleForward connects to target and relays data
+func handleForward(conn net.Conn, id int64, target string, verbose bool) {
 	defer conn.Close()
 
-	// Connect to target
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
 		if verbose {
-			log.Printf("[%d] Failed to connect to %s: %v", id, target, err)
+			log.Printf("[%d] Dial %s failed: %v", id, target, err)
 		}
 		return
 	}
 	defer targetConn.Close()
 
-	// Apply TCP options for performance
-	setTCPOptions(targetConn, mode)
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 
 	if verbose {
-		log.Printf("[%d] Forward: client -> %s", id, target)
+		log.Printf("[%d] Forward -> %s", id, target)
 	}
 
-	// Relay data
-	sent, recv := relay(conn, targetConn)
-
-	if verbose {
-		log.Printf("[%d] Closed: sent=%d recv=%d", id, sent, recv)
-	}
+	relay(conn, targetConn)
 }
 
-// smux config with mode-based optimization (inspired by Backhaul)
-func getSmuxConfig(mode perfMode) *smux.Config {
-	cfg := smux.DefaultConfig()
-	cfg.Version = 2
-
-	switch mode {
-	case modeLatency:
-		// Optimized for web browsing - smaller frames, faster keepalive
-		cfg.KeepAliveInterval = 10 * time.Second
-		cfg.KeepAliveTimeout = 30 * time.Second
-		cfg.MaxFrameSize = 16 * 1024              // 16KB frames
-		cfg.MaxReceiveBuffer = 512 * 1024         // 512KB
-		cfg.MaxStreamBuffer = 128 * 1024          // 128KB per stream
-	case modeThroughput:
-		// Optimized for downloads/streaming - larger buffers (like Backhaul)
-		cfg.KeepAliveInterval = 20 * time.Second
-		cfg.KeepAliveTimeout = 40 * time.Second
-		cfg.MaxFrameSize = 32 * 1024              // 32KB frames
-		cfg.MaxReceiveBuffer = 4 * 1024 * 1024    // 4MB (Backhaul default)
-		cfg.MaxStreamBuffer = 256 * 1024          // 256KB per stream
-	default: // modeBalanced
-		// Balanced settings
-		cfg.KeepAliveInterval = 15 * time.Second
-		cfg.KeepAliveTimeout = 35 * time.Second
-		cfg.MaxFrameSize = 24 * 1024              // 24KB frames
-		cfg.MaxReceiveBuffer = 1 * 1024 * 1024    // 1MB
-		cfg.MaxStreamBuffer = 256 * 1024          // 256KB per stream
-	}
-
-	return cfg
-}
-
-// setTCPOptions applies socket optimizations (inspired by Backhaul)
-func setTCPOptions(conn net.Conn, mode perfMode) {
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return
-	}
-
-	// Always enable TCP_NODELAY for lower latency
-	tcpConn.SetNoDelay(true)
-
-	// Set socket buffers based on mode
-	switch mode {
-	case modeLatency:
-		// Smaller buffers for lower latency
-		tcpConn.SetReadBuffer(256 * 1024)   // 256KB
-		tcpConn.SetWriteBuffer(256 * 1024)
-	case modeThroughput:
-		// Larger buffers for higher throughput
-		tcpConn.SetReadBuffer(2 * 1024 * 1024)   // 2MB
-		tcpConn.SetWriteBuffer(2 * 1024 * 1024)
-	default:
-		// Balanced
-		tcpConn.SetReadBuffer(512 * 1024)   // 512KB
-		tcpConn.SetWriteBuffer(512 * 1024)
-	}
-
-	// Enable keepalive
-	tcpConn.SetKeepAlive(true)
-	tcpConn.SetKeepAlivePeriod(30 * time.Second)
-}
-
-// handleReverseRegister handles reverse mode registration with SMUX multiplexing
-// cmd format: <listen-port>:<forward-target>
-func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool, mode perfMode) {
+// handleReverseRegister sets up reverse tunnel listener
+func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
+	// Format: <listen-port>:<local-addr>
 	parts := strings.SplitN(cmd, ":", 2)
 	if len(parts) != 2 {
-		if verbose {
-			log.Printf("[%d] Invalid reverse cmd: %s", id, cmd)
-		}
+		log.Printf("[%d] Invalid reverse cmd: %s", id, cmd)
 		conn.Close()
 		return
 	}
 
 	listenPort := parts[0]
-	forwardAddr := parts[1]
+	localAddr := parts[1]
 	listenAddr := "0.0.0.0:" + listenPort
 
-	// Check if already listening - if so, close old session and take over
+	// Close existing session if any
 	globalReverse.Lock()
-	if oldSession, exists := globalReverse.listeners[listenPort]; exists {
-		log.Printf("[%d] Replacing old session on port %s", id, listenPort)
-		// Close old session
-		oldSession.listener.Close()
-		oldSession.controlConn.Close()
-		delete(globalReverse.listeners, listenPort)
+	if old, exists := globalReverse.sessions[listenPort]; exists {
+		log.Printf("[%d] Replacing session on port %s", id, listenPort)
+		close(old.done)
+		old.listener.Close()
+		old.controlConn.Close()
+		delete(globalReverse.sessions, listenPort)
 	}
 	globalReverse.Unlock()
 
-	// Start listener
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Printf("[%d] Failed to listen on %s: %v", id, listenAddr, err)
+		log.Printf("[%d] Listen %s failed: %v", id, listenAddr, err)
 		conn.Close()
 		return
 	}
 
-	log.Printf("[%d] Reverse tunnel: listening on %s -> client -> %s", id, listenAddr, forwardAddr)
+	log.Printf("[%d] Reverse: :%s -> tunnel -> %s", id, listenPort, localAddr)
 
-	// Send OK to client before starting smux
-	conn.Write([]byte("OK\n"))
+	// Send OK
+	conn.Write([]byte("OK"))
 
-	// Create smux session - SERVER mode (we accept streams from client)
-	// Client will open streams, server accepts them
-	muxSession, err := smux.Server(conn, getSmuxConfig(mode))
-	if err != nil {
-		log.Printf("[%d] Failed to create smux session: %v", id, err)
-		listener.Close()
-		conn.Close()
-		return
-	}
-
-	log.Printf("[%d] SMUX session established (multiplexed)", id)
-
-	// Track session
-	globalReverse.Lock()
 	session := &reverseSession{
 		listener:    listener,
 		controlConn: conn,
-		forwardAddr: forwardAddr,
-		connQueue:   make(chan net.Conn, 1000),  // Larger queue (like Backhaul)
-		verbose:     verbose,
-		mode:        mode,
-	}
-	globalReverse.listeners[listenPort] = session
-	globalReverse.Unlock()
-
-	var streamID int64
-
-	// Accept incoming connections and relay through smux streams
-	for {
-		incomingConn, err := listener.Accept()
-		if err != nil {
-			if verbose {
-				log.Printf("[%d] Reverse accept error: %v", id, err)
-			}
-			break
-		}
-
-		// Apply TCP optimizations (inspired by Backhaul)
-		setTCPOptions(incomingConn, mode)
-
-		// Open smux stream to client (FAST - no new TLS handshake!)
-		stream, err := muxSession.OpenStream()
-		if err != nil {
-			if verbose {
-				log.Printf("[%d] Failed to open smux stream: %v", id, err)
-			}
-			incomingConn.Close()
-			break
-		}
-
-		sid := atomic.AddInt64(&streamID, 1)
-		if verbose {
-			log.Printf("[%d] Stream %d: %s -> client -> %s", id, sid, incomingConn.RemoteAddr(), forwardAddr)
-		}
-
-		// Relay in goroutine
-		go func(incoming net.Conn, stream *smux.Stream, sid int64) {
-			defer incoming.Close()
-			defer stream.Close()
-			sent, recv := relay(incoming, stream)
-			if verbose {
-				log.Printf("[%d] Stream %d closed: sent=%d recv=%d", id, sid, sent, recv)
-			}
-		}(incomingConn, stream, sid)
+		localAddr:   localAddr,
+		done:        make(chan struct{}),
 	}
 
-	// Cleanup
 	globalReverse.Lock()
-	delete(globalReverse.listeners, listenPort)
+	globalReverse.sessions[listenPort] = session
 	globalReverse.Unlock()
 
-	muxSession.Close()
-	listener.Close()
-	close(session.connQueue)
+	// Handle incoming connections
+	go func() {
+		for {
+			select {
+			case <-session.done:
+				return
+			default:
+			}
 
-	// Drain and close any remaining connections
-	for c := range session.connQueue {
-		c.Close()
+			listener.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+			inConn, err := listener.Accept()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				if verbose {
+					log.Printf("[%d] Accept error: %v", id, err)
+				}
+				break
+			}
+
+			// Request new tunnel connection from client
+			// Send signal: "NEW:<local-addr>\n"
+			signal := fmt.Sprintf("NEW:%s\n", localAddr)
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, err = conn.Write([]byte(signal))
+			conn.SetWriteDeadline(time.Time{})
+			if err != nil {
+				if verbose {
+					log.Printf("[%d] Signal write failed: %v", id, err)
+				}
+				inConn.Close()
+				break
+			}
+
+			// Wait for client to connect back with tunnel
+			// Store incoming connection for matching
+			go waitForTunnelAndRelay(inConn, session, verbose)
+		}
+
+		// Cleanup
+		globalReverse.Lock()
+		delete(globalReverse.sessions, listenPort)
+		globalReverse.Unlock()
+		listener.Close()
+		conn.Close()
+		log.Printf("[%d] Reverse tunnel closed for port %s", id, listenPort)
+	}()
+
+	// Read signals from control connection (keepalive)
+	buf := make([]byte, 64)
+	for {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
 	}
 
-	log.Printf("[%d] Reverse tunnel closed for port %s", id, listenPort)
+	close(session.done)
 }
 
-// relayClient runs the fast relay client
+// Pending connections waiting for tunnel - FIFO queue per localAddr
+var pendingConns = struct {
+	sync.Mutex
+	queues map[string][]chan net.Conn
+}{queues: make(map[string][]chan net.Conn)}
+
+func waitForTunnelAndRelay(inConn net.Conn, session *reverseSession, verbose bool) {
+	ch := make(chan net.Conn, 1)
+
+	// Add to queue for this localAddr
+	pendingConns.Lock()
+	pendingConns.queues[session.localAddr] = append(pendingConns.queues[session.localAddr], ch)
+	pendingConns.Unlock()
+
+	// Wait for tunnel connection
+	select {
+	case tunnelConn := <-ch:
+		if tc, ok := inConn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+		if verbose {
+			log.Printf("Relaying: incoming <-> tunnel -> %s", session.localAddr)
+		}
+		relay(inConn, tunnelConn)
+	case <-time.After(10 * time.Second):
+		if verbose {
+			log.Printf("Tunnel timeout for %s", session.localAddr)
+		}
+		inConn.Close()
+	case <-session.done:
+		inConn.Close()
+	}
+}
+
+// handleTunnelConn handles a tunnel connection from client (T: prefix)
+func handleTunnelConn(conn net.Conn, id int64, localAddr string, verbose bool) {
+	// Find pending connection for this localAddr
+	pendingConns.Lock()
+	queue := pendingConns.queues[localAddr]
+	if len(queue) > 0 {
+		// Pop first waiting channel (FIFO)
+		ch := queue[0]
+		pendingConns.queues[localAddr] = queue[1:]
+		pendingConns.Unlock()
+
+		// Send this tunnel connection to the waiting goroutine
+		ch <- conn
+		if verbose {
+			log.Printf("[%d] Tunnel matched for %s", id, localAddr)
+		}
+		return
+	}
+	pendingConns.Unlock()
+
+	// No pending connection - close
+	if verbose {
+		log.Printf("[%d] No pending conn for tunnel %s", id, localAddr)
+	}
+	conn.Close()
+}
+
+// relayClient runs the relay client
 func relayClient(args []string) {
 	flags := flag.NewFlagSet("relay-client", flag.ContinueOnError)
 
 	realityPubkey := flags.String("reality-pubkey", "", "")
 	realityShortID := flags.String("reality-shortid", "", "")
 	sni := flags.String("sni", "www.microsoft.com", "")
+	fpStr := flags.String("fingerprint", "chrome", "")
 	tlsSkipVerify := flags.Bool("tls-skip-verify", false, "")
 	noTLS := flags.Bool("no-tls", false, "")
-	muxSessions := flags.Int("mux-sessions", 2, "")  // Number of parallel SMUX sessions
-	poolSize := flags.Int("pool-size", 4, "")        // Connection pool size (Backhaul-inspired)
-	modeStr := flags.String("mode", "balanced", "")  // Performance mode
 	verbose := flags.Bool("v", false, "")
 
 	flags.Usage = func() {
@@ -616,7 +580,7 @@ func relayClient(args []string) {
 
 	args = flags.Args()
 	if len(args) < 2 {
-		log.Fatal("Usage: chisel relay-client [options] <server> <local>:<remote> or R:<remote-port>:<local>")
+		log.Fatal("Usage: chisel relay-client [options] <server> <mapping>")
 	}
 
 	server := args[0]
@@ -639,11 +603,8 @@ func relayClient(args []string) {
 		}
 	}
 
-	// Determine if server uses TLS
+	fp := parseFingerprint(*fpStr)
 	useTLS := !*noTLS
-	if !useTLS {
-		log.Printf("relay-client: WARNING - TLS disabled, traffic NOT DPI resistant!")
-	}
 
 	server = strings.TrimPrefix(server, "https://")
 	server = strings.TrimPrefix(server, "http://")
@@ -655,300 +616,269 @@ func relayClient(args []string) {
 		}
 	}
 
-	// Create client config with validation
-	numMuxSessions := *muxSessions
-	if numMuxSessions < 1 {
-		numMuxSessions = 1
-	}
-	if numMuxSessions > 8 {
-		numMuxSessions = 8  // Max 8 parallel sessions
-	}
-
-	numPoolSize := *poolSize
-	if numPoolSize < 1 {
-		numPoolSize = 1
-	}
-	if numPoolSize > 16 {
-		numPoolSize = 16  // Max 16 pooled connections
+	cfg := &clientConfig{
+		server:         server,
+		pubKey:         pubKey,
+		shortID:        shortID,
+		realityEnabled: realityEnabled,
+		useTLS:         useTLS,
+		tlsSkipVerify:  *tlsSkipVerify,
+		sni:            *sni,
+		fingerprint:    fp,
+		verbose:        *verbose,
 	}
 
-	mode := parsePerfMode(*modeStr)
-
-	clientCfg := &relayClientConfig{
-		server:          server,
-		pubKey:          pubKey,
-		shortID:         shortID,
-		realityEnabled:  realityEnabled,
-		useTLS:          useTLS,
-		tlsSkipVerify:   *tlsSkipVerify,
-		sni:             *sni,
-		verbose:         *verbose,
-		muxSessions:     numMuxSessions,
-		poolSize:        numPoolSize,
-		mode:            mode,
-	}
-
-	// Check if reverse mode
 	if strings.HasPrefix(mapping, "R:") {
-		runReverseClient(mapping[2:], clientCfg)
-		return
+		runReverseClient(mapping[2:], cfg)
+	} else {
+		runForwardClient(mapping, cfg)
 	}
+}
 
-	// Forward mode - parse mapping
+type clientConfig struct {
+	server         string
+	pubKey         [32]byte
+	shortID        []byte
+	realityEnabled bool
+	useTLS         bool
+	tlsSkipVerify  bool
+	sni            string
+	fingerprint    fingerprint
+	verbose        bool
+}
+
+func runForwardClient(mapping string, cfg *clientConfig) {
 	parts := strings.SplitN(mapping, ":", 3)
 	var localAddr, remoteAddr string
 
 	if len(parts) == 2 {
-		// local:remote (same port)
 		localAddr = "0.0.0.0:" + parts[0]
 		remoteAddr = "localhost:" + parts[1]
 	} else if len(parts) == 3 {
-		// localport:remotehost:remoteport or localip:localport:...
-		if strings.Contains(parts[0], ".") {
-			// localip:localport:remoteport - assume remote is localhost
-			localAddr = parts[0] + ":" + parts[1]
-			remoteAddr = "localhost:" + parts[2]
-		} else {
-			// localport:remotehost:remoteport
-			localAddr = "0.0.0.0:" + parts[0]
-			remoteAddr = parts[1] + ":" + parts[2]
-		}
+		localAddr = "0.0.0.0:" + parts[0]
+		remoteAddr = parts[1] + ":" + parts[2]
 	} else {
-		// Try parsing as full format: localip:localport:remotehost:remoteport
-		fullParts := strings.Split(mapping, ":")
-		if len(fullParts) == 4 {
-			localAddr = fullParts[0] + ":" + fullParts[1]
-			remoteAddr = fullParts[2] + ":" + fullParts[3]
-		} else {
-			log.Fatalf("Invalid mapping format: %s", mapping)
-		}
+		log.Fatalf("Invalid mapping: %s", mapping)
 	}
 
-	log.Printf("relay-client: Forward mode")
-	log.Printf("relay-client: Forwarding %s -> %s -> %s", localAddr, server, remoteAddr)
-	if realityEnabled {
-		log.Printf("relay-client: Reality auth enabled, SNI: %s", *sni)
-	}
+	log.Printf("relay-client: Forward %s -> %s -> %s", localAddr, cfg.server, remoteAddr)
 
-	// Start local listener
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", localAddr, err)
+		log.Fatalf("Listen failed: %v", err)
 	}
-
-	log.Printf("relay-client: Listening on %s", localAddr)
 
 	var connID int64
-
 	for {
-		localConn, err := listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
 			continue
 		}
-
 		id := atomic.AddInt64(&connID, 1)
-		go handleLocalConnection(localConn, id, remoteAddr, clientCfg)
+		go handleForwardClient(conn, id, remoteAddr, cfg)
 	}
 }
 
-// relayClientConfig holds client configuration
-type relayClientConfig struct {
-	server          string
-	pubKey          [32]byte
-	shortID         []byte
-	realityEnabled  bool
-	useTLS          bool
-	tlsSkipVerify   bool
-	sni             string
-	verbose         bool
-	muxSessions     int      // Number of parallel SMUX sessions
-	poolSize        int      // Connection pool size for forward mode
-	mode            perfMode // Performance mode
+func handleForwardClient(localConn net.Conn, id int64, remoteAddr string, cfg *clientConfig) {
+	defer localConn.Close()
+
+	serverConn, err := dialServer(cfg)
+	if err != nil {
+		if cfg.verbose {
+			log.Printf("[%d] Dial server failed: %v", id, err)
+		}
+		return
+	}
+	defer serverConn.Close()
+
+	if err := sendAuth(serverConn, remoteAddr, cfg); err != nil {
+		if cfg.verbose {
+			log.Printf("[%d] Auth failed: %v", id, err)
+		}
+		return
+	}
+
+	if cfg.verbose {
+		log.Printf("[%d] Forward -> %s", id, remoteAddr)
+	}
+
+	relay(localConn, serverConn)
 }
 
-// runReverseClient runs the reverse mode client with SMUX multiplexing
-// mapping format: <server-listen-port>:<local-host>:<local-port>
-func runReverseClient(mapping string, cfg *relayClientConfig) {
+func runReverseClient(mapping string, cfg *clientConfig) {
 	parts := strings.SplitN(mapping, ":", 3)
-	if len(parts) < 2 {
-		log.Fatalf("Invalid reverse mapping: %s (expected port:host:port or port:port)", mapping)
-	}
-
 	var listenPort, localAddr string
+
 	if len(parts) == 2 {
 		listenPort = parts[0]
 		localAddr = "localhost:" + parts[1]
-	} else {
+	} else if len(parts) == 3 {
 		listenPort = parts[0]
 		localAddr = parts[1] + ":" + parts[2]
+	} else {
+		log.Fatalf("Invalid mapping: %s", mapping)
 	}
 
-	log.Printf("relay-client: Reverse mode with SMUX multiplexing")
-	log.Printf("relay-client: Server %s listens on :%s -> tunnel -> local %s", cfg.server, listenPort, localAddr)
-	log.Printf("relay-client: Performance mode: %v, SMUX sessions: %d", cfg.mode, cfg.muxSessions)
-	if cfg.realityEnabled {
-		log.Printf("relay-client: Reality auth enabled, SNI: %s", cfg.sni)
-	}
+	log.Printf("relay-client: Reverse mode")
+	log.Printf("relay-client: Server :%s -> tunnel -> local %s", listenPort, localAddr)
 
 	for {
-		// Connect to server
-		controlConn, err := dialServer(cfg)
+		if err := runReverseSession(listenPort, localAddr, cfg); err != nil {
+			log.Printf("Session error: %v, reconnecting in 3s...", err)
+			time.Sleep(3 * time.Second)
+		}
+	}
+}
+
+func runReverseSession(listenPort, localAddr string, cfg *clientConfig) error {
+	// Connect control channel
+	controlConn, err := dialServer(cfg)
+	if err != nil {
+		return fmt.Errorf("dial failed: %v", err)
+	}
+
+	// Register reverse tunnel
+	cmd := fmt.Sprintf("R:%s:%s", listenPort, localAddr)
+	if err := sendAuth(controlConn, cmd, cfg); err != nil {
+		controlConn.Close()
+		return fmt.Errorf("auth failed: %v", err)
+	}
+
+	// Wait for OK
+	buf := make([]byte, 2)
+	controlConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := controlConn.Read(buf)
+	controlConn.SetReadDeadline(time.Time{})
+	if err != nil || string(buf[:n]) != "OK" {
+		controlConn.Close()
+		return fmt.Errorf("registration failed")
+	}
+
+	log.Printf("relay-client: Connected, server listening on :%s", listenPort)
+
+	// Read signals from server
+	reader := make([]byte, 256)
+	for {
+		controlConn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		n, err := controlConn.Read(reader)
 		if err != nil {
-			log.Printf("Failed to connect: %v, retrying in 5s...", err)
-			time.Sleep(5 * time.Second)
-			continue
+			return fmt.Errorf("control read: %v", err)
 		}
 
-		// Send reverse registration: R:<listen-port>:<forward-target>
-		cmd := fmt.Sprintf("R:%s:%s", listenPort, localAddr)
-		if err := sendCommand(controlConn, cmd, cfg); err != nil {
-			log.Printf("Failed to send command: %v", err)
-			controlConn.Close()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		// Wait for OK
-		buf := make([]byte, 3)
-		controlConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		n, err := controlConn.Read(buf)
-		if err != nil || !strings.HasPrefix(string(buf[:n]), "OK") {
-			log.Printf("Failed to register reverse tunnel: %v", err)
-			controlConn.Close()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		controlConn.SetReadDeadline(time.Time{})
-
-		// Create smux session - CLIENT mode (server opens streams, we accept them)
-		muxSession, err := smux.Client(controlConn, getSmuxConfig(cfg.mode))
-		if err != nil {
-			log.Printf("Failed to create smux session: %v", err)
-			controlConn.Close()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		log.Printf("relay-client: SMUX session established, server listening on :%s", listenPort)
-
-		// Accept streams from server and relay to local service
-		var streamID int64
-		for {
-			stream, err := muxSession.AcceptStream()
-			if err != nil {
-				if cfg.verbose {
-					log.Printf("SMUX session error: %v", err)
-				}
-				break
+		// Parse signal
+		signal := string(reader[:n])
+		lines := strings.Split(signal, "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "NEW:") {
+				target := strings.TrimPrefix(line, "NEW:")
+				go handleNewTunnel(target, cfg)
 			}
-
-			sid := atomic.AddInt64(&streamID, 1)
-
-			// Connect to local service
-			go func(stream *smux.Stream, sid int64) {
-				defer stream.Close()
-
-				localConn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
-				if err != nil {
-					if cfg.verbose {
-						log.Printf("Stream %d: Failed to connect to local %s: %v", sid, localAddr, err)
-					}
-					return
-				}
-				defer localConn.Close()
-
-				// Apply TCP optimizations (inspired by Backhaul)
-				setTCPOptions(localConn, cfg.mode)
-
-				if cfg.verbose {
-					log.Printf("Stream %d: server -> tunnel -> %s", sid, localAddr)
-				}
-
-				sent, recv := relay(stream, localConn)
-
-				if cfg.verbose {
-					log.Printf("Stream %d: closed, sent=%d recv=%d", sid, sent, recv)
-				}
-			}(stream, sid)
 		}
 
-		muxSession.Close()
-		log.Printf("relay-client: Connection lost, reconnecting...")
-		time.Sleep(1 * time.Second)
+		// Send keepalive
+		controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		controlConn.Write([]byte("K"))
+		controlConn.SetWriteDeadline(time.Time{})
 	}
 }
 
-// dialServer creates a connection to the relay server with DPI evasion
-func dialServer(cfg *relayClientConfig) (net.Conn, error) {
-	var conn net.Conn
-	var err error
-
-	if cfg.useTLS {
-		// Use uTLS for Chrome fingerprint (DPI evasion)
-		tcpConn, err := net.DialTimeout("tcp", cfg.server, dialTimeout)
-		if err != nil {
-			return nil, err
-		}
-
-		// Apply TCP optimizations (inspired by Backhaul)
-		setTCPOptions(tcpConn, cfg.mode)
-
-		// Use SNI for DPI evasion - looks like connecting to legitimate site
-		sni := cfg.sni
-		if sni == "" {
-			sni, _, _ = net.SplitHostPort(cfg.server)
-		}
-
-		utlsConfig := &utls.Config{
-			ServerName:         sni,                          // SNI spoofing
-			InsecureSkipVerify: cfg.tlsSkipVerify,
-			NextProtos:         []string{"h2", "http/1.1"},   // ALPN - looks like HTTP/2
-		}
-
-		// Use Chrome fingerprint for maximum compatibility
-		tlsConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
-		if err := tlsConn.Handshake(); err != nil {
-			tcpConn.Close()
-			return nil, fmt.Errorf("TLS handshake failed (SNI: %s): %v", sni, err)
-		}
-		conn = tlsConn
-
+func handleNewTunnel(localAddr string, cfg *clientConfig) {
+	// Connect to server for new tunnel
+	tunnelConn, err := dialServer(cfg)
+	if err != nil {
 		if cfg.verbose {
-			log.Printf("TLS connected with SNI: %s, ALPN: h2", sni)
+			log.Printf("Tunnel dial failed: %v", err)
 		}
-	} else {
-		// Raw TCP (not recommended - DPI can detect)
-		conn, err = net.DialTimeout("tcp", cfg.server, dialTimeout)
-		if err != nil {
-			return nil, err
-		}
-		// Apply TCP optimizations
-		setTCPOptions(conn, cfg.mode)
+		return
 	}
 
-	return conn, nil
+	// Send tunnel marker (T: prefix means this is a tunnel connection)
+	cmd := fmt.Sprintf("T:%s", localAddr)
+	if err := sendAuth(tunnelConn, cmd, cfg); err != nil {
+		tunnelConn.Close()
+		return
+	}
+
+	// Connect to local service
+	localConn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
+	if err != nil {
+		if cfg.verbose {
+			log.Printf("Local dial %s failed: %v", localAddr, err)
+		}
+		tunnelConn.Close()
+		return
+	}
+
+	if tc, ok := localConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
+	if cfg.verbose {
+		log.Printf("Tunnel: server -> %s", localAddr)
+	}
+
+	relay(tunnelConn, localConn)
 }
 
-// sendCommand sends authenticated command to server
-func sendCommand(conn net.Conn, cmd string, cfg *relayClientConfig) error {
+func dialServer(cfg *clientConfig) (net.Conn, error) {
+	tcpConn, err := net.DialTimeout("tcp", cfg.server, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	if tc, ok := tcpConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	if !cfg.useTLS {
+		return tcpConn, nil
+	}
+
+	// Use uTLS with fingerprint
+	sni := cfg.sni
+	if sni == "" {
+		sni, _, _ = net.SplitHostPort(cfg.server)
+	}
+
+	utlsConfig := &utls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: cfg.tlsSkipVerify,
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+
+	helloID := getClientHelloID(cfg.fingerprint)
+	tlsConn := utls.UClient(tcpConn, utlsConfig, helloID)
+
+	if err := tlsConn.Handshake(); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("TLS handshake failed: %v", err)
+	}
+
+	if cfg.verbose {
+		log.Printf("TLS connected: SNI=%s", sni)
+	}
+
+	return tlsConn, nil
+}
+
+func sendAuth(conn net.Conn, cmd string, cfg *clientConfig) error {
 	conn.SetDeadline(time.Now().Add(authTimeout))
 	defer conn.SetDeadline(time.Time{})
 
 	if cfg.realityEnabled {
-		// Create Reality session
 		sessionID, clientPubKey, err := reality.CreateSessionID(cfg.pubKey, cfg.shortID)
 		if err != nil {
 			return err
 		}
 
-		// Send auth: [2 bytes: len][32 bytes sessionID][32 bytes pubkey]
 		authData := make([]byte, 64)
 		copy(authData[:32], sessionID[:])
 		copy(authData[32:], clientPubKey[:])
 
 		authLen := make([]byte, 2)
-		binary.BigEndian.PutUint16(authLen, uint16(len(authData)))
+		binary.BigEndian.PutUint16(authLen, 64)
 
 		if _, err := conn.Write(authLen); err != nil {
 			return err
@@ -958,12 +888,7 @@ func sendCommand(conn net.Conn, cmd string, cfg *relayClientConfig) error {
 		}
 	}
 
-	// Send command: [1 byte: len][command string]
 	cmdBytes := []byte(cmd)
-	if len(cmdBytes) > maxTargetLen {
-		return fmt.Errorf("command too long")
-	}
-
 	if _, err := conn.Write([]byte{byte(len(cmdBytes))}); err != nil {
 		return err
 	}
@@ -974,77 +899,52 @@ func sendCommand(conn net.Conn, cmd string, cfg *relayClientConfig) error {
 	return nil
 }
 
-func handleLocalConnection(localConn net.Conn, id int64, remoteAddr string, cfg *relayClientConfig) {
-	defer localConn.Close()
-
-	// Connect to server
-	serverConn, err := dialServer(cfg)
-	if err != nil {
-		if cfg.verbose {
-			log.Printf("[%d] Failed to connect to server: %v", id, err)
-		}
-		return
-	}
-	defer serverConn.Close()
-
-	// Send target (forward command)
-	if err := sendCommand(serverConn, remoteAddr, cfg); err != nil {
-		if cfg.verbose {
-			log.Printf("[%d] Failed to send command: %v", id, err)
-		}
-		return
-	}
-
-	if cfg.verbose {
-		log.Printf("[%d] Forward: local -> %s -> %s", id, cfg.server, remoteAddr)
-	}
-
-	// Relay
-	sent, recv := relay(localConn, serverConn)
-
-	if cfg.verbose {
-		log.Printf("[%d] Closed: sent=%d recv=%d", id, sent, recv)
-	}
-}
-
-// closeWrite attempts to close the write side of a connection
-func closeWrite(conn net.Conn) {
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.CloseWrite()
-	}
-	// For TLS connections, we can't do half-close, so just let it close fully
-}
-
-// relay copies data bidirectionally between two connections
-func relay(c1, c2 net.Conn) (int64, int64) {
-	var sent, recv int64
+// relay copies data bidirectionally with low latency
+func relay(c1, c2 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Use io.Copy which can use splice() on Linux for TCP-to-TCP
-	// For TLS/SMUX it falls back to efficient buffered copy
-
-	// c1 -> c2
-	go func() {
+	copy := func(dst, src net.Conn) {
 		defer wg.Done()
-		n, _ := io.Copy(c2, c1)
-		sent = n
-		closeWrite(c2)
-	}()
+		buf := make([]byte, copyBufSize)
+		for {
+			src.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := src.Read(buf)
+			if n > 0 {
+				dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				_, werr := dst.Write(buf[:n])
+				if werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		// Half-close
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}
 
-	// c2 -> c1
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(c1, c2)
-		recv = n
-		closeWrite(c1)
-	}()
+	go copy(c1, c2)
+	go copy(c2, c1)
 
 	wg.Wait()
-	return sent, recv
+	c1.Close()
+	c2.Close()
 }
 
-// Add to main.go switch statement
+// Fingerprint rotation (call periodically to change fingerprint)
+var currentFingerprint = fpChrome
+
+func rotateFingerprint() fingerprint {
+	fps := []fingerprint{fpChrome, fpFirefox, fpSafari}
+	currentFingerprint = fps[mrand.Intn(len(fps))]
+	return currentFingerprint
+}
+
+// For main.go
 func handleRelayCommand(subcmd string, args []string) bool {
 	switch subcmd {
 	case "relay-server":
