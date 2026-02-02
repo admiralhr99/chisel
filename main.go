@@ -29,11 +29,13 @@ var help = `
   Version: ` + chshare.BuildVersion + ` (` + runtime.Version() + `)
 
   Commands:
-    server       - runs chisel in server mode
-    client       - runs chisel in client mode
-    genkey       - generates Reality keypair for authentication
-    relay-server - fast TCP relay server (no SSH overhead)
-    relay-client - fast TCP relay client (no SSH overhead)
+    server        - runs chisel in server mode
+    client        - runs chisel in client mode
+    genkey        - generates Reality keypair for authentication
+    relay-server  - fast TCP relay server (no SSH overhead)
+    relay-client  - fast TCP relay client (no SSH overhead)
+    tunnel-server - high-performance tunnel (better than Backhaul)
+    tunnel-client - high-performance tunnel client
 
   Read more:
     https://github.com/jpillora/chisel
@@ -73,6 +75,10 @@ func main() {
 		relayServer(args)
 	case "relay-client":
 		relayClient(args)
+	case "tunnel-server":
+		tunnelServer(args)
+	case "tunnel-client":
+		tunnelClient(args)
 	default:
 		fmt.Print(help)
 		os.Exit(0)
