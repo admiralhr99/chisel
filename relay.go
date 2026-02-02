@@ -403,13 +403,14 @@ func handleReverseRegister(conn net.Conn, id int64, cmd string, verbose bool) {
 	forwardAddr := parts[1]
 	listenAddr := "0.0.0.0:" + listenPort
 
-	// Check if already listening
+	// Check if already listening - if so, close old session and take over
 	globalReverse.Lock()
-	if _, exists := globalReverse.listeners[listenPort]; exists {
-		globalReverse.Unlock()
-		log.Printf("[%d] Reverse port %s already in use", id, listenPort)
-		conn.Close()
-		return
+	if oldSession, exists := globalReverse.listeners[listenPort]; exists {
+		log.Printf("[%d] Replacing old session on port %s", id, listenPort)
+		// Close old session
+		oldSession.listener.Close()
+		oldSession.controlConn.Close()
+		delete(globalReverse.listeners, listenPort)
 	}
 	globalReverse.Unlock()
 
