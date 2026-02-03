@@ -51,9 +51,9 @@ var tunnelHelp = `
     --pool-size        Connection pool size (default: 8)
     --tls-skip-verify  Skip TLS certificate verification (default: true)
     --sni              TLS SNI hostname (default: server hostname)
-    --fragment         Fragment TLS handshake (default: true)
-    --fragment-size    Fragment size in bytes (default: 2-8 random)
-    --fragment-delay   Delay between fragments ms (default: 2-8ms)
+    --fragment         Fragment TLS handshake (default: false)
+    --fragment-size    Fragment size in bytes (default: 50-100)
+    --fragment-delay   Delay between fragments ms (default: 10-30ms)
     --padding          Enable random padding (default: true)
     --no-tls           Disable TLS
     -v                 Verbose logging
@@ -692,9 +692,9 @@ func tunnelClient(args []string) {
 
 	password := flags.String("password", "", "")
 	poolSize := flags.Int("pool-size", 8, "")
-	fragment := flags.Bool("fragment", true, "")
-	fragSize := flags.String("fragment-size", "2-8", "")     // Smaller fragments for DPI evasion
-	fragDelay := flags.String("fragment-delay", "2-8", "")   // Shorter delays
+	fragment := flags.Bool("fragment", false, "")  // Disabled by default - can break TLS
+	fragSize := flags.String("fragment-size", "50-100", "")     // Larger fragments
+	fragDelay := flags.String("fragment-delay", "10-30", "")    // Reasonable delays
 	padding := flags.Bool("padding", true, "")
 	noTLS := flags.Bool("no-tls", false, "")
 	tlsSkipVerify := flags.Bool("tls-skip-verify", true, "")  // Default true for self-signed certs
@@ -725,19 +725,19 @@ func tunnelClient(args []string) {
 	var fragMin, fragMax int
 	fmt.Sscanf(*fragSize, "%d-%d", &fragMin, &fragMax)
 	if fragMin == 0 {
-		fragMin = 2
+		fragMin = 50
 	}
 	if fragMax == 0 {
-		fragMax = 8
+		fragMax = 100
 	}
 
 	var delayMin, delayMax int
 	fmt.Sscanf(*fragDelay, "%d-%d", &delayMin, &delayMax)
 	if delayMin == 0 {
-		delayMin = 2
+		delayMin = 10
 	}
 	if delayMax == 0 {
-		delayMax = 8
+		delayMax = 30
 	}
 
 	client := &TunnelClient{
