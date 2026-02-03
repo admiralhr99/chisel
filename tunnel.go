@@ -49,6 +49,8 @@ var tunnelHelp = `
   tunnel-client options:
     --password         Authentication password
     --pool-size        Connection pool size (default: 8)
+    --tls-skip-verify  Skip TLS certificate verification (default: true)
+    --sni              TLS SNI hostname (default: server hostname)
     --fragment         Fragment TLS handshake (default: true)
     --fragment-size    Fragment size in bytes (default: 40-80 random)
     --fragment-delay   Delay between fragments (default: 10-50ms)
@@ -637,17 +639,19 @@ func (s *TunnelServer) waitAndRelay(inConn net.Conn, ctrlConn net.Conn, id int64
 // ============== CLIENT ==============
 
 type TunnelClient struct {
-	server       string
-	password     string
-	useTLS       bool
-	fragment     bool
-	fragMinSize  int
-	fragMaxSize  int
-	fragMinDelay time.Duration
-	fragMaxDelay time.Duration
-	padding      bool
-	verbose      bool
-	pool         *ConnPool
+	server        string
+	password      string
+	useTLS        bool
+	tlsSkipVerify bool
+	sni           string
+	fragment      bool
+	fragMinSize   int
+	fragMaxSize   int
+	fragMinDelay  time.Duration
+	fragMaxDelay  time.Duration
+	padding       bool
+	verbose       bool
+	pool          *ConnPool
 }
 
 func tunnelClient(args []string) {
@@ -660,6 +664,8 @@ func tunnelClient(args []string) {
 	fragDelay := flags.String("fragment-delay", "10-50", "")
 	padding := flags.Bool("padding", true, "")
 	noTLS := flags.Bool("no-tls", false, "")
+	tlsSkipVerify := flags.Bool("tls-skip-verify", true, "")  // Default true for self-signed certs
+	sni := flags.String("sni", "", "")
 	verbose := flags.Bool("v", false, "")
 
 	flags.Usage = func() { fmt.Print(tunnelHelp); os.Exit(0) }
@@ -702,16 +708,18 @@ func tunnelClient(args []string) {
 	}
 
 	client := &TunnelClient{
-		server:       server,
-		password:     *password,
-		useTLS:       !*noTLS,
-		fragment:     *fragment,
-		fragMinSize:  fragMin,
-		fragMaxSize:  fragMax,
-		fragMinDelay: time.Duration(delayMin) * time.Millisecond,
-		fragMaxDelay: time.Duration(delayMax) * time.Millisecond,
-		padding:      *padding,
-		verbose:      *verbose,
+		server:        server,
+		password:      *password,
+		useTLS:        !*noTLS,
+		tlsSkipVerify: *tlsSkipVerify,
+		sni:           *sni,
+		fragment:      *fragment,
+		fragMinSize:   fragMin,
+		fragMaxSize:   fragMax,
+		fragMinDelay:  time.Duration(delayMin) * time.Millisecond,
+		fragMaxDelay:  time.Duration(delayMax) * time.Millisecond,
+		padding:       *padding,
+		verbose:       *verbose,
 	}
 
 	// Create connection pool
@@ -774,8 +782,17 @@ func (c *TunnelClient) dial() (net.Conn, error) {
 		log.Printf("Starting TLS handshake...")
 	}
 
+	// Determine SNI
+	serverName := c.sni
+	if serverName == "" {
+		// Use server hostname as SNI
+		host, _, _ := net.SplitHostPort(c.server)
+		serverName = host
+	}
+
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
+		ServerName:         serverName,
+		InsecureSkipVerify: c.tlsSkipVerify,
 		MinVersion:         tls.VersionTLS12,
 	}
 	tlsConn := tls.Client(conn, tlsConfig)
@@ -785,7 +802,7 @@ func (c *TunnelClient) dial() (net.Conn, error) {
 	}
 
 	if c.verbose {
-		log.Printf("TLS connected (version: %x)", tlsConn.ConnectionState().Version)
+		log.Printf("TLS connected (version: %x, SNI: %s)", tlsConn.ConnectionState().Version, serverName)
 	}
 
 	return tlsConn, nil
