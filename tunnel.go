@@ -52,8 +52,8 @@ var tunnelHelp = `
     --tls-skip-verify  Skip TLS certificate verification (default: true)
     --sni              TLS SNI hostname (default: server hostname)
     --fragment         Fragment TLS handshake (default: true)
-    --fragment-size    Fragment size in bytes (default: 40-80 random)
-    --fragment-delay   Delay between fragments (default: 10-50ms)
+    --fragment-size    Fragment size in bytes (default: 2-8 random)
+    --fragment-delay   Delay between fragments ms (default: 2-8ms)
     --padding          Enable random padding (default: true)
     --no-tls           Disable TLS
     -v                 Verbose logging
@@ -415,16 +415,32 @@ func (s *TunnelServer) handleConn(conn net.Conn) {
 	}
 
 	// Read auth
+	if s.verbose {
+		log.Printf("[%d] Waiting for auth...", id)
+	}
 	cmd, data, err := readPacket(conn)
-	if err != nil || cmd != cmdAuth {
+	if err != nil {
+		if s.verbose {
+			log.Printf("[%d] Auth read error: %v", id, err)
+		}
+		conn.Close()
+		return
+	}
+	if cmd != cmdAuth {
+		if s.verbose {
+			log.Printf("[%d] Expected auth cmd, got: %d", id, cmd)
+		}
 		conn.Close()
 		return
 	}
 
 	// Verify password
+	if s.verbose {
+		log.Printf("[%d] Got auth, password len=%d", id, len(data))
+	}
 	if s.password != "" && string(data) != s.password {
 		if s.verbose {
-			log.Printf("[%d] Auth failed", id)
+			log.Printf("[%d] Password mismatch", id)
 		}
 		writePacket(conn, cmdError, []byte("auth failed"))
 		conn.Close()
@@ -432,7 +448,16 @@ func (s *TunnelServer) handleConn(conn net.Conn) {
 	}
 
 	// Send OK
-	writePacket(conn, cmdOK, nil)
+	if s.verbose {
+		log.Printf("[%d] Sending OK...", id)
+	}
+	if err := writePacket(conn, cmdOK, nil); err != nil {
+		if s.verbose {
+			log.Printf("[%d] Failed to send OK: %v", id, err)
+		}
+		conn.Close()
+		return
+	}
 
 	if s.verbose {
 		log.Printf("[%d] Authenticated", id)
@@ -660,8 +685,8 @@ func tunnelClient(args []string) {
 	password := flags.String("password", "", "")
 	poolSize := flags.Int("pool-size", 8, "")
 	fragment := flags.Bool("fragment", true, "")
-	fragSize := flags.String("fragment-size", "40-80", "")
-	fragDelay := flags.String("fragment-delay", "10-50", "")
+	fragSize := flags.String("fragment-size", "2-8", "")     // Smaller fragments for DPI evasion
+	fragDelay := flags.String("fragment-delay", "2-8", "")   // Shorter delays
 	padding := flags.Bool("padding", true, "")
 	noTLS := flags.Bool("no-tls", false, "")
 	tlsSkipVerify := flags.Bool("tls-skip-verify", true, "")  // Default true for self-signed certs
@@ -692,19 +717,19 @@ func tunnelClient(args []string) {
 	var fragMin, fragMax int
 	fmt.Sscanf(*fragSize, "%d-%d", &fragMin, &fragMax)
 	if fragMin == 0 {
-		fragMin = 40
+		fragMin = 2
 	}
 	if fragMax == 0 {
-		fragMax = 80
+		fragMax = 8
 	}
 
 	var delayMin, delayMax int
 	fmt.Sscanf(*fragDelay, "%d-%d", &delayMin, &delayMax)
 	if delayMin == 0 {
-		delayMin = 10
+		delayMin = 2
 	}
 	if delayMax == 0 {
-		delayMax = 50
+		delayMax = 8
 	}
 
 	client := &TunnelClient{
@@ -815,16 +840,30 @@ func (c *TunnelClient) dialAndAuth() (net.Conn, error) {
 	}
 
 	// Send auth
+	if c.verbose {
+		log.Printf("Sending auth packet...")
+	}
 	if err := writePacket(conn, cmdAuth, []byte(c.password)); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("auth send failed: %v", err)
 	}
 
 	// Read response
-	cmd, _, err := readPacket(conn)
-	if err != nil || cmd != cmdOK {
+	if c.verbose {
+		log.Printf("Waiting for auth response...")
+	}
+	cmd, data, err := readPacket(conn)
+	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("auth failed")
+		return nil, fmt.Errorf("auth response read failed: %v", err)
+	}
+	if cmd != cmdOK {
+		conn.Close()
+		return nil, fmt.Errorf("auth rejected: cmd=%d data=%s", cmd, string(data))
+	}
+
+	if c.verbose {
+		log.Printf("Authenticated successfully")
 	}
 
 	return conn, nil
