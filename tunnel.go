@@ -113,10 +113,18 @@ func (p *ConnPool) warmup() {
 		if p.closed {
 			return
 		}
-		conn, err := p.factory()
+		// Retry up to 3 times per connection
+		var conn net.Conn
+		var err error
+		for retry := 0; retry < 3; retry++ {
+			conn, err = p.factory()
+			if err == nil {
+				break
+			}
+			log.Printf("Pool warmup %d/%d attempt %d failed: %v", i+1, p.size, retry+1, err)
+			time.Sleep(time.Duration(retry+1) * time.Second)
+		}
 		if err != nil {
-			log.Printf("Pool warmup %d/%d failed: %v", i+1, p.size, err)
-			time.Sleep(time.Second)
 			continue
 		}
 		select {
@@ -314,7 +322,7 @@ func writePacket(conn net.Conn, cmd byte, data []byte) error {
 
 func readPacket(conn net.Conn) (byte, []byte, error) {
 	header := make([]byte, 3)
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))  // Reduced from 60s
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, nil, err
 	}
@@ -949,8 +957,8 @@ func (c *TunnelClient) runReverse(mapping string) {
 
 	for {
 		if err := c.runReverseSession(listenPort, localAddr); err != nil {
-			log.Printf("Reverse session error: %v, reconnecting...", err)
-			time.Sleep(3 * time.Second)
+			log.Printf("Reverse session error: %v, reconnecting in 1s...", err)
+			time.Sleep(1 * time.Second)  // Fast reconnect
 		}
 	}
 }
