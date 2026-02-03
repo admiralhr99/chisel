@@ -113,11 +113,13 @@ func (p *ConnPool) warmup() {
 		}
 		conn, err := p.factory()
 		if err != nil {
+			log.Printf("Pool warmup %d/%d failed: %v", i+1, p.size, err)
 			time.Sleep(time.Second)
 			continue
 		}
 		select {
 		case p.conns <- conn:
+			log.Printf("Pool warmup %d/%d OK", i+1, p.size)
 		default:
 			conn.Close()
 		}
@@ -734,9 +736,17 @@ func tunnelClient(args []string) {
 }
 
 func (c *TunnelClient) dial() (net.Conn, error) {
+	if c.verbose {
+		log.Printf("Dialing %s...", c.server)
+	}
+
 	tcpConn, err := net.DialTimeout("tcp", c.server, 10*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TCP dial failed: %v", err)
+	}
+
+	if c.verbose {
+		log.Printf("TCP connected to %s", c.server)
 	}
 
 	if tc, ok := tcpConn.(*net.TCPConn); ok {
@@ -752,10 +762,18 @@ func (c *TunnelClient) dial() (net.Conn, error) {
 	// Wrap with fragmentation if enabled
 	var conn net.Conn = tcpConn
 	if c.fragment {
+		if c.verbose {
+			log.Printf("TLS fragmentation enabled: %d-%d bytes, %v-%v delay",
+				c.fragMinSize, c.fragMaxSize, c.fragMinDelay, c.fragMaxDelay)
+		}
 		conn = NewFragmentedConn(tcpConn, c.fragMinSize, c.fragMaxSize, c.fragMinDelay, c.fragMaxDelay)
 	}
 
 	// TLS handshake
+	if c.verbose {
+		log.Printf("Starting TLS handshake...")
+	}
+
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
@@ -763,7 +781,11 @@ func (c *TunnelClient) dial() (net.Conn, error) {
 	tlsConn := tls.Client(conn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
 		tcpConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("TLS handshake failed: %v", err)
+	}
+
+	if c.verbose {
+		log.Printf("TLS connected (version: %x)", tlsConn.ConnectionState().Version)
 	}
 
 	return tlsConn, nil
